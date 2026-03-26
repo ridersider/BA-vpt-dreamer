@@ -110,10 +110,20 @@ c = c.replace(
     'cmd="java -Djava.awt.headless=true -Dfml.ignoreMissingCert=true -Dfml.coreMods.load=com.microsoft.Malmo.OverclockingPlugin'
 )
 
-# xvfb-run durch direktes Starten mit gesetztem DISPLAY ersetzen
+# Eigener Xvfb + xrandr-Mode pro Instanz (LWJGL2 braucht mind. 1 XRandR-Mode)
 c = c.replace(
     'if [ "$MINEDOJO_HEADLESS" == "1" ]; then\n  xvfb-run -a -s "-screen 0 1024x768x24" $cmd\nelse\n  $cmd\nfi',
-    'export DISPLAY=${DISPLAY:-:99}\n$cmd'
+    'XVFB_DISP=:$(($$$%100+200))\n'
+    'Xvfb $XVFB_DISP -screen 0 1280x720x24 +extension GLX -ac &\n'
+    'XVFB_PID=$!\n'
+    'sleep 1\n'
+    'export DISPLAY=$XVFB_DISP\n'
+    'xrandr --newmode "1280x720" 74.48 1280 1344 1472 1664 720 723 728 748 -hsync +vsync 2>/dev/null || true\n'
+    'xrandr --addmode default "1280x720" 2>/dev/null || true\n'
+    'xrandr --output default --mode "1280x720" 2>/dev/null || true\n'
+    'export LIBGL_ALWAYS_SOFTWARE=1\n'
+    '$cmd\n'
+    'kill $XVFB_PID 2>/dev/null || true'
 )
 
 path.write_text(c)

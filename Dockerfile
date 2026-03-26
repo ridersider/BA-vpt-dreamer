@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y \
     openjdk-8-jdk \
     python3.9 python3.9-dev python3-pip \
     git wget curl \
-    xvfb x11-utils \
+    xvfb x11-utils x11-xserver-utils \
     libgl1-mesa-dev libglu1-mesa-dev freeglut3-dev \
     libgl1-mesa-glx libegl1-mesa \
     ffmpeg \
