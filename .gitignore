@@ -1,0 +1,14 @@
+# Lokale Daten (nicht ins Repo)
+models/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Claude
+.claude/

@@ -1,0 +1,15 @@
+services:
+  vpt-dreamer:
+    build: .
+    image: vpt-dreamer:v2
+    platform: linux/amd64
+    container_name: vpt_dreamer_dev
+    environment:
+      - DISPLAY=:99
+      - MINEDOJO_HEADLESS=1
+    volumes:
+      - ./models:/workspace/models
+      - ./src:/workspace/src
+      - ./logs:/workspace/logs
+    stdin_open: true
+    tty: true
