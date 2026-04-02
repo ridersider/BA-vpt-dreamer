@@ -113,7 +113,7 @@ c = c.replace(
 # Eigener Xvfb + xrandr-Mode pro Instanz (LWJGL2 braucht mind. 1 XRandR-Mode)
 c = c.replace(
     'if [ "$MINEDOJO_HEADLESS" == "1" ]; then\n  xvfb-run -a -s "-screen 0 1024x768x24" $cmd\nelse\n  $cmd\nfi',
-    'XVFB_DISP=:$(($$$%100+200))\n'
+    'XVFB_DISP=:$(( $$ % 100 + 200 ))\n'
     'Xvfb $XVFB_DISP -screen 0 1280x720x24 +extension GLX -ac &\n'
     'XVFB_PID=$!\n'
     'sleep 1\n'

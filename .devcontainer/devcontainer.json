@@ -1,7 +1,7 @@
 {
   "name": "VPT-Dreamer",
   "dockerComposeFile": "../docker-compose.yml",
-  "service": "vpt-dreamer",        // ← muss dem service-Namen in docker-compose.yml entsprechen
+  "service": "vpt-dreamer",
   "workspaceFolder": "/workspace",
   "customizations": {
     "vscode": {

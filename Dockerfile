@@ -55,10 +55,16 @@ COPY repos/vpt       /workspace/vpt
 COPY docker/setup_minedojo.sh /tmp/setup_minedojo.sh
 RUN chmod +x /tmp/setup_minedojo.sh && /tmp/setup_minedojo.sh
 
+# ── MineRL (nach MineDojo, damit /opt/local-maven-repo existiert) ─
+COPY docker/setup_minerl.sh /tmp/setup_minerl.sh
+RUN chmod +x /tmp/setup_minerl.sh && /tmp/setup_minerl.sh
+
 # ── Arbeitsverzeichnisse anlegen ──────────────────────────────
 RUN mkdir -p /workspace/src /workspace/models /workspace/logs
 
 WORKDIR /workspace
 
-# Xvfb beim Start (für Minecraft-Rendering nötig)
-CMD ["bash", "-c", "Xvfb :99 -screen 0 1280x720x24 +extension GLX & sleep 1 && bash"]
+# Xvfb beim Start (für Minecraft-Rendering nötig).
+# ENTRYPOINT statt CMD, damit Dev Containers es nicht überschreiben.
+ENTRYPOINT ["bash", "-c", "Xvfb :99 -screen 0 1280x720x24 +extension GLX & sleep 1 && exec \"$@\"", "--"]
+CMD ["bash"]
