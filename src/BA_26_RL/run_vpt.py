@@ -11,37 +11,27 @@ from minerl.herobraine.env_specs.human_survival_specs import HumanSurvival
 from agent import MineRLAgent, ENV_KWARGS
 
 
-LOG_KEYS = [
-    "oak_log",      "birch_log",     "spruce_log",
-    "jungle_log",   "acacia_log",    "dark_oak_log",
-    "oak_wood",     "birch_wood",    "spruce_wood",
-    "jungle_wood",  "acacia_wood",   "dark_oak_wood",
-]
-
-
 class LogHarvestEnv(gym.Wrapper):
     """
     HumanSurvival + Reward für Holzsammeln.
-    Reward = Summe aller neu gesammelten Holzblöcke (alle Holzarten) pro Step.
+    Reward = Anzahl neu gesammelter Logs pro Step (Delta im Inventory).
+    validate_env() von MineRLAgent sieht durch den Wrapper hindurch,
+    da gym.Wrapper Attribute an die innere Env weiterleitet.
     """
     def __init__(self, env):
         super().__init__(env)
-        self._prev_total = 0
-
-    def _count_logs(self, obs):
-        inv = obs["inventory"]
-        return sum(int(inv[k]) for k in LOG_KEYS)
+        self._prev_logs = 0
 
     def reset(self):
         obs = self.env.reset()
-        self._prev_total = self._count_logs(obs)
+        self._prev_logs = int(obs["inventory"]["log"])
         return obs
 
     def step(self, action):
         obs, _, done, info = self.env.step(action)
-        total = self._count_logs(obs)
-        reward = float(total - self._prev_total)
-        self._prev_total = total
+        logs = int(obs["inventory"]["log"])
+        reward = float(logs - self._prev_logs)
+        self._prev_logs = logs
         return obs, reward, done, info
 
 MODEL_PATH   = "/workspace/models/foundation-model-1x.model"
@@ -57,7 +47,7 @@ def main():
     pi_head_kwargs["temperature"] = float(pi_head_kwargs["temperature"])
 
     print("Starting MineRL environment...")
-    env = LogHarvestEnv(HumanSurvival(**ENV_KWARGS).make())
+    env = HumanSurvival(**ENV_KWARGS).make()
     agent = MineRLAgent(env, policy_kwargs=policy_kwargs, pi_head_kwargs=pi_head_kwargs)
     agent.load_weights(WEIGHTS_PATH)
 

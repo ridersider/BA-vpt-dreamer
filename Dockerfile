@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     xvfb x11-utils x11-xserver-utils \
     libgl1-mesa-dev libglu1-mesa-dev freeglut3-dev \
     libgl1-mesa-glx libegl1-mesa \
+    libgl1-mesa-dri \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
