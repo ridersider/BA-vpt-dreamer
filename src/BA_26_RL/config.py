@@ -5,10 +5,10 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class PPOConfig:
     # Rollout
-    n_steps: int = 1024
+    n_steps: int = 4096
 
     # PPO hyperparameters
-    n_epochs: int = 1
+    n_epochs: int = 3
     batch_size: int = 64
     gamma: float = 0.999
     gae_lambda: float = 0.95
@@ -28,9 +28,12 @@ class PPOConfig:
     out_weights_path: str = "/workspace/models/ppo_finetuned.weights"
 
     # Training length
-    total_timesteps: int = 10240
+    total_timesteps: int = 50_000
+
+    # Checkpointing
+    checkpoint_every_n_updates: int = 10
 
     # Video / logging
-    record_every_n_updates: int = 5
+    record_every_n_updates: int = 10
     video_fps: int = 20
     log_dir: str = field(default_factory=lambda: f"/workspace/logs/run_{int(time.time())}")

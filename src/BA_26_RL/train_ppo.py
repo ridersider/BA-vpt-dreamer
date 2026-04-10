@@ -98,6 +98,7 @@ def main():
     done = False
     total_steps = 0
     update_num = 0
+    total_reward = 0.0
 
     print(f"[train_ppo] Starting training for {config.total_timesteps} steps.")
 
@@ -106,7 +107,11 @@ def main():
 
         # ── Rollout collection (no gradients) ──────────────────────────────
         policy.eval()
+        rollout_reward = 0.0
+        video_logger.start_rollout(update_num)
         for _ in range(config.n_steps):
+            video_logger.add_frame(obs["pov"])
+
             env_action, agent_action, log_prob, value, hidden, obs_128 = actor.step(
                 obs, hidden, done
             )
@@ -114,6 +119,8 @@ def main():
 
             buffer.add(obs_128, agent_action, reward, done, value, log_prob)
 
+            rollout_reward += reward
+            total_reward += reward
             obs = next_obs
             total_steps += 1
 
@@ -126,6 +133,11 @@ def main():
         buffer.finalize(last_value, done)
 
         # ── PPO update ─────────────────────────────────────────────────────
+        if rollout_reward == 0.0:
+            print(f"[Update {update_num + 1:4d}] Skipping update (no reward collected).")
+            update_num += 1
+            continue
+
         policy.train()
         metrics = updater.update(buffer)
 
@@ -140,12 +152,19 @@ def main():
             f"policy_loss={metrics['policy_loss']:.4f}  "
             f"value_loss={metrics['value_loss']:.4f}  "
             f"entropy={metrics['entropy']:.4f}  "
-            f"approx_kl={metrics['approx_kl']:.4f}"
+            f"approx_kl={metrics['approx_kl']:.4f}  "
+            f"rollout_reward={rollout_reward:.1f}  total_reward={total_reward:.1f}"
         )
 
         # ── Logging + optional video recording ────────────────────────────
         video_logger.log_metrics(update_num, metrics)
-        video_logger.maybe_record(update_num, actor, env)
+        video_logger.maybe_save_video(update_num)
+
+        # ── Checkpoint ─────────────────────────────────────────────────────
+        if update_num % config.checkpoint_every_n_updates == 0:
+            ckpt_path = os.path.join(config.log_dir, f"checkpoint_{update_num:05d}.weights")
+            th.save(policy.state_dict(), ckpt_path)
+            print(f"[train_ppo] Checkpoint saved to {ckpt_path}")
 
     # ── Save final weights ─────────────────────────────────────────────────
     th.save(policy.state_dict(), config.out_weights_path)
