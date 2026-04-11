@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class PPOConfig:
     # Rollout
-    n_steps: int = 4096
+    n_steps: int = 512
 
     # PPO hyperparameters
     n_epochs: int = 3
@@ -32,6 +32,10 @@ class PPOConfig:
 
     # Checkpointing
     checkpoint_every_n_updates: int = 10
+
+    # Live stream
+    stream_port: int = 8080
+    stream_fps: int = 10
 
     # Video / logging
     record_every_n_updates: int = 10

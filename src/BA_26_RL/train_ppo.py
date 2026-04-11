@@ -8,8 +8,8 @@ import gym
 import torch as th
 from gym3.types import DictType
 
-from minerl.herobraine.env_specs.human_survival_specs import HumanSurvival
 from agent import ENV_KWARGS
+from tree_flat_env import TreeFlatEnv
 from lib.action_mapping import CameraHierarchicalMapping
 from lib.actions import ActionTransformer
 from lib.policy import MinecraftAgentPolicy
@@ -19,6 +19,7 @@ from vpt_actor import VPTActor, LogHarvestEnv
 from rollout_buffer import VPTRolloutBuffer
 from ppo_updater import PPOUpdater
 from video_logger import VideoLogger
+from live_stream import LiveStreamer
 
 # ── Constants taken from repos/vpt/agent.py ────────────────────────────────
 PI_HEAD_KWARGS = {"temperature": 2.0}
@@ -64,7 +65,7 @@ def main():
     device = th.device("cpu")
 
     # ── Environment ────────────────────────────────────────────────────────
-    env = LogHarvestEnv(HumanSurvival(**ENV_KWARGS).make())
+    env = LogHarvestEnv(TreeFlatEnv(**ENV_KWARGS).make())
     print("[train_ppo] MineRL LogHarvestEnv created.")
 
     # ── Policy ─────────────────────────────────────────────────────────────
@@ -86,6 +87,8 @@ def main():
         weight_decay=config.weight_decay,
     )
     updater = PPOUpdater(policy, optimizer, config)
+    streamer = LiveStreamer(port=config.stream_port, fps=config.stream_fps)
+    streamer.start()
     video_logger = VideoLogger(
         log_dir=config.log_dir,
         fps=config.video_fps,
@@ -111,6 +114,7 @@ def main():
         video_logger.start_rollout(update_num)
         for _ in range(config.n_steps):
             video_logger.add_frame(obs["pov"])
+            streamer.push_frame(obs["pov"])
 
             env_action, agent_action, log_prob, value, hidden, obs_128 = actor.step(
                 obs, hidden, done
