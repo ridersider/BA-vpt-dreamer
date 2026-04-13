@@ -30,6 +30,7 @@ TREE_TYPES = [
     ("minecraft:jungle_log",   "minecraft:jungle_leaves"),
     ("minecraft:acacia_log",   "minecraft:acacia_leaves"),
     ("minecraft:dark_oak_log", "minecraft:dark_oak_leaves"),
+    ("minecraft:dirt")
 ]
 
 # Superflat: bedrock at y=0, 2x dirt y=1-2, grass at y=3 → trees start at y=4
@@ -98,7 +99,7 @@ class TreeFlatEnv(HumanSurvival):
     def create_agent_start(self) -> List[Handler]:
         return super().create_agent_start() + [
             handlers.InventoryAgentStart({
-                0: {"type": "iron_axe", "quantity": 1},
+                0: {"type": "iron_shovel", "quantity": 1},
             })
         ]
 

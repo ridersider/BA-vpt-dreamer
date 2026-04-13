@@ -10,6 +10,7 @@ from gym3.types import DictType
 
 from agent import ENV_KWARGS
 from tree_flat_env import TreeFlatEnv
+from survival_env import SurvivalEnv
 from lib.action_mapping import CameraHierarchicalMapping
 from lib.actions import ActionTransformer
 from lib.policy import MinecraftAgentPolicy
@@ -65,7 +66,7 @@ def main():
     device = th.device("cpu")
 
     # ── Environment ────────────────────────────────────────────────────────
-    env = LogHarvestEnv(TreeFlatEnv(**ENV_KWARGS).make())
+    env = LogHarvestEnv(SurvivalEnv(**ENV_KWARGS).make())
     print("[train_ppo] MineRL LogHarvestEnv created.")
 
     # ── Policy ─────────────────────────────────────────────────────────────
@@ -74,13 +75,18 @@ def main():
 
     # ── Training components ────────────────────────────────────────────────
     actor = VPTActor(policy, action_mapper, action_transformer, device)
+    buffer_capacity = (
+        config.n_steps if config.update_mode == "fixed"
+        else config.max_steps_no_reward
+    )
     buffer = VPTRolloutBuffer(
-        n_steps=config.n_steps,
+        capacity=buffer_capacity,
         image_shape=(128, 128, 3),
         gamma=config.gamma,
         gae_lambda=config.gae_lambda,
         device=device,
     )
+    print(f"[train_ppo] update_mode={config.update_mode!r}, buffer capacity={buffer_capacity}")
     optimizer = th.optim.Adam(
         policy.parameters(),
         lr=config.learning_rate,
@@ -112,33 +118,62 @@ def main():
         policy.eval()
         rollout_reward = 0.0
         video_logger.start_rollout(update_num)
-        for _ in range(config.n_steps):
-            video_logger.add_frame(obs["pov"])
-            streamer.push_frame(obs["pov"])
 
-            env_action, agent_action, log_prob, value, hidden, obs_128 = actor.step(
-                obs, hidden, done
-            )
-            next_obs, reward, done, _ = env.step(env_action)
+        if config.update_mode == "fixed":
+            # Collect exactly n_steps, then always update
+            for _ in range(config.n_steps):
+                video_logger.add_frame(obs["pov"])
+                streamer.push_frame(obs["pov"])
 
-            buffer.add(obs_128, agent_action, reward, done, value, log_prob)
+                env_action, agent_action, log_prob, value, hidden, obs_128 = actor.step(
+                    obs, hidden, done
+                )
+                next_obs, reward, done, _ = env.step(env_action)
 
-            rollout_reward += reward
-            total_reward += reward
-            obs = next_obs
-            total_steps += 1
+                buffer.add(obs_128, agent_action, reward, done, value, log_prob)
 
-            if done:
-                obs = env.reset()
-                hidden = actor.get_initial_hidden_state()
+                rollout_reward += reward
+                total_reward += reward
+                obs = next_obs
+                total_steps += 1
+
+                if done:
+                    obs = env.reset()
+                    hidden = actor.get_initial_hidden_state()
+
+        else:  # "reward_triggered"
+            # Collect steps until reward > 0 or buffer full
+            while not buffer.full and total_steps < config.total_timesteps:
+                video_logger.add_frame(obs["pov"])
+                streamer.push_frame(obs["pov"])
+
+                env_action, agent_action, log_prob, value, hidden, obs_128 = actor.step(
+                    obs, hidden, done
+                )
+                next_obs, reward, done, _ = env.step(env_action)
+
+                buffer.add(obs_128, agent_action, reward, done, value, log_prob)
+
+                rollout_reward += reward
+                total_reward += reward
+                obs = next_obs
+                total_steps += 1
+
+                if done:
+                    obs = env.reset()
+                    hidden = actor.get_initial_hidden_state()
+
+                if rollout_reward > 0.0:
+                    break  # reward received → trigger update
 
         # ── Compute GAE ────────────────────────────────────────────────────
         _, _, _, last_value, _, _ = actor.step(obs, hidden, done)
         buffer.finalize(last_value, done)
 
         # ── PPO update ─────────────────────────────────────────────────────
-        if rollout_reward == 0.0:
-            print(f"[Update {update_num + 1:4d}] Skipping update (no reward collected).")
+        if config.update_mode == "reward_triggered" and rollout_reward == 0.0:
+            # Buffer was full but no reward found – skip update
+            print(f"[Update {update_num + 1:4d}] Skipping update (buffer full, no reward).")
             update_num += 1
             continue
 
@@ -152,7 +187,7 @@ def main():
 
         update_num += 1
         print(
-            f"[Update {update_num:4d} | Steps {total_steps:8d}] "
+            f"[Update {update_num:4d} | Steps {total_steps:8d} | rollout_steps={buffer.pos}] "
             f"policy_loss={metrics['policy_loss']:.4f}  "
             f"value_loss={metrics['value_loss']:.4f}  "
             f"entropy={metrics['entropy']:.4f}  "
@@ -161,7 +196,11 @@ def main():
         )
 
         # ── Logging + optional video recording ────────────────────────────
-        video_logger.log_metrics(update_num, metrics)
+        video_logger.log_metrics(update_num, {
+            **metrics,
+            "rollout_reward": rollout_reward,
+            "total_reward": total_reward,
+        })
         video_logger.maybe_save_video(update_num)
 
         # ── Checkpoint ─────────────────────────────────────────────────────

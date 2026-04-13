@@ -5,10 +5,14 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class PPOConfig:
     # Rollout
+    # "fixed"           – collect exactly n_steps, always update
+    # "reward_triggered" – collect until reward > 0 (or max_steps_no_reward), then update
+    update_mode: str = "reward_triggered"
     n_steps: int = 512
+    max_steps_no_reward: int = 4096  # cap for reward_triggered mode
 
     # PPO hyperparameters
-    n_epochs: int = 3
+    n_epochs: int = 1
     batch_size: int = 64
     gamma: float = 0.999
     gae_lambda: float = 0.95

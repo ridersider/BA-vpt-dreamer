@@ -6,12 +6,16 @@ import torch as th
 
 class VPTRolloutBuffer:
     """
-    Stores one rollout of (obs, action, reward, done, value, log_prob) tuples
-    and computes GAE advantages + lambda-returns.
+    Stores transitions of (obs, action, reward, done, value, log_prob) and
+    computes GAE advantages + lambda-returns.
+
+    capacity  – maximum number of steps that can be stored (pre-allocated).
+    Actual used size is tracked via self.pos; finalize() and get() operate
+    only on the filled portion [0 : self.pos].
     """
 
-    def __init__(self, n_steps: int, image_shape: tuple, gamma: float, gae_lambda: float, device):
-        self.n_steps = n_steps
+    def __init__(self, capacity: int, image_shape: tuple, gamma: float, gae_lambda: float, device):
+        self.capacity = capacity
         self.image_shape = image_shape  # (H, W, C)
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -19,15 +23,19 @@ class VPTRolloutBuffer:
         self.pos = 0
 
         H, W, C = image_shape
-        self.obs_imgs = np.zeros((n_steps, H, W, C), dtype=np.uint8)
-        self.buttons = np.zeros((n_steps, 1), dtype=np.int64)
-        self.cameras = np.zeros((n_steps, 1), dtype=np.int64)
-        self.rewards = np.zeros(n_steps, dtype=np.float32)
-        self.dones = np.zeros(n_steps, dtype=np.float32)
-        self.values = np.zeros(n_steps, dtype=np.float32)
-        self.log_probs = np.zeros(n_steps, dtype=np.float32)
-        self.advantages = np.zeros(n_steps, dtype=np.float32)
-        self.returns = np.zeros(n_steps, dtype=np.float32)
+        self.obs_imgs = np.zeros((capacity, H, W, C), dtype=np.uint8)
+        self.buttons = np.zeros((capacity, 1), dtype=np.int64)
+        self.cameras = np.zeros((capacity, 1), dtype=np.int64)
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.dones = np.zeros(capacity, dtype=np.float32)
+        self.values = np.zeros(capacity, dtype=np.float32)
+        self.log_probs = np.zeros(capacity, dtype=np.float32)
+        self.advantages = np.zeros(capacity, dtype=np.float32)
+        self.returns = np.zeros(capacity, dtype=np.float32)
+
+    @property
+    def full(self) -> bool:
+        return self.pos >= self.capacity
 
     def reset(self):
         self.pos = 0
@@ -35,6 +43,7 @@ class VPTRolloutBuffer:
     def add(self, obs_img: np.ndarray, agent_action: dict, reward: float,
             done: bool, value: float, log_prob: float):
         """Store one transition. obs_img must be (H, W, C) uint8."""
+        assert self.pos < self.capacity, "Buffer is full – call reset() first."
         t = self.pos
         self.obs_imgs[t] = obs_img
         self.buttons[t] = agent_action["buttons"].cpu().numpy()
@@ -47,12 +56,13 @@ class VPTRolloutBuffer:
 
     def finalize(self, last_value: float, last_done: bool):
         """
-        Compute GAE advantages and lambda-returns.
-        Must be called after the rollout is complete (pos == n_steps).
+        Compute GAE advantages and lambda-returns for steps [0 : self.pos].
+        Must be called after the rollout is complete.
         """
+        n = self.pos
         last_gae_lam = 0.0
-        for t in reversed(range(self.n_steps)):
-            if t == self.n_steps - 1:
+        for t in reversed(range(n)):
+            if t == n - 1:
                 next_non_terminal = 1.0 - float(last_done)
                 next_value = last_value
             else:
@@ -67,13 +77,14 @@ class VPTRolloutBuffer:
                 delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
             )
             self.advantages[t] = last_gae_lam
-        self.returns = self.advantages + self.values
+        self.returns[:n] = self.advantages[:n] + self.values[:n]
 
     def get(self, batch_size: int) -> Generator[dict, None, None]:
-        """Yield shuffled minibatches as dicts of tensors."""
-        indices = np.random.permutation(self.n_steps)
+        """Yield shuffled minibatches over the filled portion [0 : self.pos]."""
+        n = self.pos
+        indices = np.random.permutation(n)
         start = 0
-        while start < self.n_steps:
+        while start < n:
             batch_idx = indices[start: start + batch_size]
             yield {
                 "obs_imgs": self.obs_imgs[batch_idx],       # (B, H, W, C) uint8
