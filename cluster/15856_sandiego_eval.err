@@ -1,0 +1,30 @@
+time="2026-05-10T11:33:00+02:00" level=warning msg="The cgroupv2 manager is set to systemd but there is no systemd user session available"
+time="2026-05-10T11:33:00+02:00" level=warning msg="For using systemd, you may need to log in using a user session"
+time="2026-05-10T11:33:00+02:00" level=warning msg="Alternatively, you can enable lingering with: `loginctl enable-linger 62254` (possibly as root)"
+time="2026-05-10T11:33:00+02:00" level=warning msg="Falling back to --cgroup-manager=cgroupfs"
+time="2026-05-10T11:33:00+02:00" level=warning msg="\"/\" is not a shared mount, this could cause issues or missing mounts with rootless containers"
+Getting image source signatures
+Copying blob sha256:4d558ea88f9dc63e3d373f56b844c48291632003de4e964f4355d03329b216b7
+Copying blob sha256:f67fb5c677f0e6c3616fe9ef4f1f0ddb8bc0abff2505e75a32f687cb0cbfacf1
+Copying blob sha256:6be31ec2c3a1da218dc21b71e32871014f29e73cf165a51f8bbf22c8329249b1
+Copying blob sha256:470b66ea5123c93b0d5606e4213bf9e47d3d426b640d32472e4ac213186c4bb6
+Copying blob sha256:e8465740e94aaf7f16a24d4c5f5dbbdad19d9a298a22d2b50982f41cc37904d1
+Copying blob sha256:5731de4337f245ad2a866da27b12319154fc4c956a9f1cb3c8e46d4eb9b73a52
+Copying blob sha256:f1fc49db87d7c488c8e568475eb80f964a0a467a29d68df001c71ad997f9c665
+Copying blob sha256:88a0989c7c0f2408c62b09eae23d25aa39df17a48c4c7cae6da913a07386c2aa
+Copying blob sha256:b8cd751d82c0a18b0c631cb5f5efda864ca8090358f39d6830c738e6b8462974
+Copying blob sha256:dae343ede540c3ee696f1bf434c57f9793daaf2a7badf01f1f75dfe2532bb663
+Copying blob sha256:ff0aa5633906fd192c49761e87348cb25c4848654cdf9d0f2b75ac14cf182320
+Copying blob sha256:8cd6b67968ab56e93c4cd9c0b92e0959c017f9ef1eda6d9aa1c4cfb95fb071a5
+Copying blob sha256:4e818046c1818a376a29711bcd59cdb88f66128498eb360ad3f7dae30553d5f1
+Copying blob sha256:e790798ab8f777cc82468f906d732e8f06560515ec17d7e2ffc5879bb94f2d31
+Copying blob sha256:752c94efae390d621a4123faf768416f64fe1003ee601457f3d5e8cd9edb46a1
+Copying blob sha256:65c686a20bdd8c915696c14591f3893fd00aa5b30f123404d0f9c582ca580b6a
+Copying blob sha256:c58ad27cb7779dea45b5b639ac1c739d480e53d03afa8a2ec0d1e31d12f3e208
+Copying config sha256:f5fe2f1ae31663e9b4177e63beb12384bae07515b3a2ea447936715bf91c8dd4
+Writing manifest to image destination
+/workspace/vpt/lib/torch_util.py:36: UserWarning: 'has_cuda' is deprecated, please use 'torch.backends.cuda.is_built()'
+  return th.has_cuda
+usage: eval.py [-h] [--weights WEIGHTS] [--steps STEPS]
+               [--mode {sequential,single}] [--out OUT] [--fps FPS]
+eval.py: error: unrecognized arguments: --no_video

@@ -1,0 +1,14 @@
+Job 13157 starting on sandiego at Sat May  2 15:17:48 CEST 2026
+Training args: --mode sequential
+==> Loading image from /raid/persistent_scratch/geifab01/vpt-dreamer-v2.tar
+Loaded image: localhost/vpt-dreamer:v2
+[train] device=cuda  mode=sequential  update_mode=fixed
+[make_env] mode=sequential  start_task=Craft Wooden Items  seed=42
+[make_env] start_inventory=[('spruce_log', 8)]
+[build_policy] Loaded weights from /workspace/models/foundation-model-1x.weights
+[build_policy] Loaded weights from /workspace/models/foundation-model-1x.weights
+[build_frozen_policy] Frozen policy loaded (KL coef=0.2)
+[LiveStreamer] Stream available at http://localhost:8080
+[train] Starting — 50 episodes × 1,000 steps/episode.
+[train] Tasks: ['Obtain Wood', 'Craft Wooden Items', 'Craft Wooden Pickaxe', 'Obtain Stone', 'Craft Stone Pickaxe']
+Job 13157 finished at Sat May  2 15:22:49 CEST 2026

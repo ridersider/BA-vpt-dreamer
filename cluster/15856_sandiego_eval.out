@@ -1,0 +1,5 @@
+Job 15856 starting on sandiego at Sun May 10 11:33:00 CEST 2026
+Eval args: --weights /workspace/models/foundation-model-1x.weights --steps 100000 --no_video
+==> Loading image from /raid/persistent_scratch/geifab01/vpt-dreamer-v2.tar
+Loaded image: localhost/vpt-dreamer:v2
+Job 15856 finished at Sun May 10 11:36:18 CEST 2026

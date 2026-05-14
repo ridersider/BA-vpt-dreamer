@@ -1,0 +1,35 @@
+time="2026-04-30T13:33:30+02:00" level=warning msg="\"/\" is not a shared mount, this could cause issues or missing mounts with rootless containers"
+Getting image source signatures
+Copying blob sha256:968c9ac7ed3df670ef945451678f8d572f2f45a12fcafa5196a189287f1cf60c
+Copying blob sha256:942c9a9e64708679da3d25cd7e0da97ebd6e77a671216be16a263c7751111993
+Copying blob sha256:60454e5be5fd88df678fc52606faa8a9bb00ecf1ecf3ea96a3584ecbb98b0da1
+Copying blob sha256:470b66ea5123c93b0d5606e4213bf9e47d3d426b640d32472e4ac213186c4bb6
+Copying blob sha256:7a60f4f9f67e178b91d8ee490719d812b7ff78a83ab186b14c4fa78bdef63099
+Copying blob sha256:a71bed0c2cd53913f89566daa3917bdfe869306d5aaa784da3ba36e1d3a2b123
+Copying blob sha256:1312c4f998be4fa7d41c68e3b3a247e5ed62654c1cc0af5c2ffabdab44d08a5d
+Copying blob sha256:9a0186e27290b86cdbbb3481e8827f809ed02c42528011a781f99afb93ad2cbf
+Copying blob sha256:b49748521b0b7e169982d514d5857978fbf8c9fe2d169d035c48c231228eac55
+Copying blob sha256:b6ff86db2a31e56662e182c50549f351826ce21896c20022711c85749df73ada
+Copying blob sha256:a083eff6182c781e5a7904c563762a87798a08bf92cebb528b5b61f37c4c8935
+Copying blob sha256:cacdfb5cc801c4e957551f20e6d387855d2f8091df708af3a9e12e4c55d73c18
+Copying blob sha256:c3b18987e083537e2e6d7133c8cf218614f99c24e956013dcca8ad3153c98fb1
+Copying blob sha256:6e334032f3aee3ce297e816eb59e656a2bb3b98b6cbfa1c58aea97236baba4a6
+Copying blob sha256:8c66c16c03e721fcfb46c8ee8088ff3796da85a3898742787bfdc4a0e6c2560a
+Copying blob sha256:34cf74d05151f9e42424dbba23b4f7be100af39bf07dd498a0d318043f84b8fe
+Copying blob sha256:98168a76104ab4facaafd00b8ffae814f3905312c830dff53f00f08a14f048a3
+Copying config sha256:6867964e67d2f22ff146f41e427c1028d2897e940ceb97aae46f0ceea24444f3
+Writing manifest to image destination
+/workspace/vpt/lib/torch_util.py:36: UserWarning: 'has_cuda' is deprecated, please use 'torch.backends.cuda.is_built()'
+  return th.has_cuda
+Traceback (most recent call last):
+  File "/workspace/src/train.py", line 335, in <module>
+    main()
+  File "/workspace/src/train.py", line 331, in main
+    train(config)
+  File "/workspace/src/train.py", line 198, in train
+    policy, action_mapper = build_policy(config, device)
+  File "/workspace/src/training_utils.py", line 41, in build_policy
+    policy_kwargs, pi_head_kwargs = load_model_parameters(config.model_path)
+  File "/workspace/src/training_utils.py", line 31, in load_model_parameters
+    agent_parameters = pickle.load(open(path, "rb"))
+FileNotFoundError: [Errno 2] No such file or directory: '/workspace/models/foundation-model-1x.model'

@@ -1,0 +1,51 @@
+#!/bin/bash
+#SBATCH --job-name=vpt-dreamer-train
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --nodes=1
+#SBATCH --nodelist=sandiego
+#SBATCH --gres=gpu:1
+#SBATCH --time=360
+#SBATCH --mem=48G
+#SBATCH --account=cai_res
+#SBATCH --partition=gpu_ia
+#SBATCH --output=/cluster/home/geifab01/vpt-dreamer/cluster/logs/%j_%N_train.out
+#SBATCH --error=/cluster/home/geifab01/vpt-dreamer/cluster/logs/%j_%N_train.err
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+ZHAW_USER="geifab01"
+PROJECT_DIR="/cluster/home/${ZHAW_USER}/vpt-dreamer"
+IMAGE_NAME="vpt-dreamer:v2"
+IMAGE_TAR="/raid/persistent_scratch/${ZHAW_USER}/vpt-dreamer-v2.tar"
+
+# ── Training args (override via --export or edit here) ────────────────────────
+TRAIN_ARGS="${TRAIN_ARGS:---mode sequential --stream_enabled False}"
+
+# ── Ensure log dir exists ──────────────────────────────────────────────────────
+mkdir -p "${PROJECT_DIR}/cluster/logs"
+
+echo "Job ${SLURM_JOB_ID} starting on $(hostname) at $(date)"
+echo "Training args: ${TRAIN_ARGS}"
+
+# ── Load image ─────────────────────────────────────────────────────────────────
+if ! podman image exists "${IMAGE_NAME}"; then
+    echo "==> Loading image from ${IMAGE_TAR}"
+    podman load -i "${IMAGE_TAR}"
+else
+    echo "==> Image ${IMAGE_NAME} already in local store"
+fi
+
+# ── Run training ───────────────────────────────────────────────────────────────
+# Podman automatically assigns all GPUs allocated by SLURM to the container.
+# src/ is mounted live so you can edit it without rebuilding the image.
+podman run --rm \
+    -v "${PROJECT_DIR}/src:/workspace/src:ro" \
+    -v "${PROJECT_DIR}/models:/workspace/models" \
+    -v "${PROJECT_DIR}/logs:/workspace/logs" \
+    -e MINEDOJO_HEADLESS=1 \
+    -e LIBGL_ALWAYS_SOFTWARE=1 \
+    -e DISPLAY=:99 \
+    "${IMAGE_NAME}" \
+    python3 -u /workspace/src/train.py ${TRAIN_ARGS}
+
+echo "Job ${SLURM_JOB_ID} finished at $(date)"
