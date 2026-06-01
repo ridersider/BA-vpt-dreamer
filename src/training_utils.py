@@ -18,6 +18,7 @@ from lib.policy import MinecraftAgentPolicy
 from config import PPOConfig
 from envs.survival_env import SurvivalEnv, SurvivalRewardEnv
 from envs.sequential_env import SequentialRewardEnv
+from envs.navigation_env import NavigationRewardEnv
 
 
 ACTION_TRANSFORMER_KWARGS = dict(
@@ -123,10 +124,27 @@ def make_env(config: PPOConfig):
     """
     Build the training environment for the configured mode.
 
-    "sequential"  SequentialRewardEnv — TASKS curriculum from config.py
-    "single"      SurvivalRewardEnv   — flat reward for config.single_task_items
+    "sequential"  SequentialRewardEnv  — TASKS curriculum from config.py
+    "single"      SurvivalRewardEnv    — flat reward for config.single_task_items
+    "navigation"  NavigationRewardEnv  — distance-delta reward to random XZ target
     """
     from config import TASKS
+
+    if config.mode == "navigation":
+        base = SurvivalEnv(**ENV_KWARGS).make()
+        env = NavigationRewardEnv(
+            base,
+            target_radius=config.nav_target_radius,
+            success_radius=config.nav_success_radius,
+            reward_scale=config.nav_reward_scale,
+            success_bonus=config.nav_success_bonus,
+            log_dir=config.log_dir,
+        )
+        print(f"[make_env] mode=navigation  target_radius={config.nav_target_radius}  "
+              f"success_radius={config.nav_success_radius}  "
+              f"reward_scale={config.nav_reward_scale}  "
+              f"success_bonus={config.nav_success_bonus}")
+        return env
 
     base = SurvivalEnv(start_inventory=config.start_inventory, **ENV_KWARGS).make()
 

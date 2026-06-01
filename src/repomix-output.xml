@@ -1,0 +1,1953 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+envs/
+  __init__.py
+  sequential_env.py
+  survival_env.py
+  tree_flat_env.py
+config.py
+eval.py
+live_stream.py
+ppo_updater.py
+rollout_buffer.py
+train.py
+training_utils.py
+video_logger.py
+vpt_actor.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="envs/__init__.py">
+import sys
+import os
+# Allow files in this package to import from src/ (e.g. `from config import ...`)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+</file>
+
+<file path="envs/sequential_env.py">
+"""
+Sequential curriculum environment.
+
+Tasks are defined in config.TASKS and come in two types:
+
+  obtain  goal_key="reward_based"
+          Task completes when accumulated reward reaches task.max_reward
+          (i.e. the agent collected the full capped quantity of every item).
+
+  craft   goal_key=<item_id>
+          Task completes when the goal item is newly acquired.
+          If action_reward_key is set, a one-time reward is given each time
+          that action is triggered (e.g. "inventory" for the 2x2 crafting grid).
+
+Info keys exposed per step:
+    task_idx           int   index of the currently active task
+    task_name          str   display name of the active task
+    task_complete      bool  True on the step the task is completed
+    all_tasks_complete bool  True when the last task is completed
+    player_died        bool  True when the episode ended due to player death
+"""
+
+from __future__ import annotations
+
+import gym
+import numpy as np
+
+from config import TASKS, TaskSpec  # noqa: F401 (TaskSpec used in type hints)
+
+
+class SequentialRewardEnv(gym.Wrapper):
+
+    def __init__(self, env: gym.Env, start_task_idx: int = 0, repeat: bool = False):
+        super().__init__(env)
+        self._start_task_idx: int = start_task_idx
+        self._task_idx: int = start_task_idx
+        self._repeat: bool = repeat
+        self._prev_inventory: dict = {}  # item_id → last seen count (updated every step)
+        self._rewarded: dict = {}        # item_id → units already rewarded (never decreases)
+        self._task_reward: float = 0.0   # accumulated reward in current task
+        self._action_open: bool = False  # toggle state for action_reward_key
+        self._goal_baseline: int = 0     # inventory count of goal item at task start
+
+    # ── Public properties ─────────────────────────────────────────────────────
+
+    @property
+    def task_idx(self) -> int:
+        return self._task_idx
+
+    @property
+    def task(self) -> TaskSpec:
+        return TASKS[self._task_idx]
+
+    # ── Inventory helpers ─────────────────────────────────────────────────────
+
+    def _read_counts(self, obs) -> dict:
+        inv = obs["inventory"]
+        return {
+            item.item_id: (
+                sum(int(inv.get(k, 0)) for k in item.variants)
+                if item.variants
+                else int(inv.get(item.item_id, 0))
+            )
+            for item in self.task.reward_items
+        }
+
+    def _read_goal_count(self, obs) -> int:
+        """Read the current inventory count of the task's goal item."""
+        return int(obs["inventory"].get(self.task.goal_key, 0))
+
+    def _snapshot(self, obs) -> None:
+        """Reset per-task accumulators. Items already in inventory count as new
+        so the agent gets immediate reward for resources carried over from previous tasks."""
+        counts = self._read_counts(obs)
+        self._prev_inventory = {item_id: 0 for item_id in counts}
+        self._rewarded = {item_id: 0 for item_id in counts}
+        self._task_reward = 0.0
+        self._action_open = False
+        self._goal_baseline = (
+            self._read_goal_count(obs)
+            if self.task.task_type == "craft"
+            else 0
+        )
+
+    # ── gym.Wrapper interface ─────────────────────────────────────────────────
+
+    def seed(self, seed: int = 42):
+        return self.env.seed(seed)
+
+    def reset(self):
+        obs = self.env.reset()
+        self._task_idx = self._start_task_idx
+        self._snapshot(obs)
+        return obs
+
+    def step(self, action):
+        obs, _, done, info = self.env.step(action)
+
+        if done:
+            self._task_idx = self._start_task_idx
+            self._snapshot(obs)
+            info.update(
+                task_idx=self._task_idx,
+                task_name=self.task.display_name,
+                task_complete=False,
+                all_tasks_complete=False,
+                player_died=True,
+            )
+            return obs, 0.0, done, info
+
+        reward = 0.0
+        task_complete = False
+
+        # ── Drop penalty (Q button) ────────────────────────────────────────────
+        #if action.get("drop", 0):
+        #    reward -= 0.5
+
+        # ── Action reward (sequential: given every step while UI is open) ──────
+        if self.task.action_reward_key and action.get(self.task.action_reward_key, 0):
+            self._action_open = not self._action_open  # key press toggles open/closed
+
+        if self._action_open:
+            reward += self.task.action_reward
+
+        # ── Item rewards ──────────────────────────────────────────────────────
+        current = self._read_counts(obs)
+        for item in self.task.reward_items:
+            prev = self._prev_inventory.get(item.item_id, 0)
+            curr = current[item.item_id]
+            new_items = max(0, curr - prev)
+
+            if new_items > 0:
+                already = self._rewarded.get(item.item_id, 0)
+                if item.max_qty == float("inf"):
+                    reward += item.reward_per_item * new_items
+                    self._rewarded[item.item_id] = already + new_items
+                else:
+                    rewardable = max(0, min(already + new_items, item.max_qty) - already)
+                    reward += item.reward_per_item * rewardable
+                    self._rewarded[item.item_id] = min(already + new_items, item.max_qty)
+
+                if self.task.task_type == "craft" and item.item_id == self.task.goal_key:
+                    task_complete = True
+
+            self._prev_inventory[item.item_id] = curr  # always track true current count
+
+        self._task_reward += reward
+
+        # ── Task completion ───────────────────────────────────────────────────
+        if self.task.task_type == "obtain":
+            if self._task_reward >= self.task.max_reward:
+                task_complete = True
+        elif self.task.goal_key not in self.task.item_reward_keys:
+            # Goal not tracked via item rewards → check inventory directly
+            if self._read_goal_count(obs) > self._goal_baseline:
+                task_complete = True
+
+        all_tasks_complete = False
+        if task_complete:
+            if self._repeat:
+                self._snapshot(obs)
+            elif self._task_idx < len(TASKS) - 1:
+                self._task_idx += 1
+                self._snapshot(obs)
+            else:
+                all_tasks_complete = True
+                done = True
+
+        info.update(
+            task_idx=self._task_idx,
+            task_name=self.task.display_name,
+            task_complete=task_complete,
+            all_tasks_complete=all_tasks_complete,
+        )
+        if task_complete:
+            info["inventory_snapshot"] = {
+                k: int(v) for k, v in obs["inventory"].items() if int(v) > 0
+            }
+        return obs, reward, done, info
+</file>
+
+<file path="envs/survival_env.py">
+from typing import Dict, List, Optional, Tuple
+
+import gym
+import minerl.herobraine.hero.handlers as handlers
+from minerl.herobraine.env_specs.human_survival_specs import HumanSurvival
+from minerl.herobraine.hero.handler import Handler
+
+from config import MASTER_REWARD_TABLE, get_reward_item, RewardItem
+
+
+class SurvivalEnv(HumanSurvival):
+    """Vanilla Minecraft survival with a fixed world seed and optional start inventory."""
+
+    def __init__(self, start_inventory: Tuple[Tuple[str, int], ...] = (), **kwargs):
+        self._start_inventory = start_inventory
+        if "name" not in kwargs:
+            kwargs["name"] = "MineRLSurvival-v0"
+        super().__init__(**kwargs)
+
+    def create_server_initial_conditions(self) -> List[Handler]:
+        return [
+            handlers.TimeInitialCondition(allow_passage_of_time=True, start_time=6000),
+            handlers.SpawningInitialCondition(allow_spawning=True),
+            handlers.DefaultWorldGenerator(force_reset=True, generator_options='{"seed": "42"}'),
+        ]
+
+    def create_agent_start(self) -> List[Handler]:
+        base = super().create_agent_start()
+        if not self._start_inventory:
+            return base
+        inv = {
+            slot: {"type": item_id, "quantity": qty}
+            for slot, (item_id, qty) in enumerate(self._start_inventory)
+        }
+        return base + [handlers.InventoryAgentStart(inv)]
+
+    def set_start_inventory(self, items: Tuple[Tuple[str, int], ...]) -> None:
+        """Update the start inventory used in the next reset's mission XML."""
+        self._start_inventory = items
+
+
+class SurvivalRewardEnv(gym.Wrapper):
+    """
+    Reward wrapper driven by config.MASTER_REWARD_TABLE.
+
+    item_ids        Optional list of item_ids to reward. When None, all items in
+                    MASTER_REWARD_TABLE are rewarded (full VPT paper reward table).
+    keep_inventory  When True, the agent's full inventory at the moment of death is
+                    restored at the next reset by updating the underlying SurvivalEnv
+                    spec before the new mission is sent to Malmo.
+    survival_spec   The SurvivalEnv instance (spec, not the made env) — required when
+                    keep_inventory=True so that set_start_inventory() can be called
+                    before each reset.
+
+    Item log
+    --------
+    Every step where an item count increases is appended to self.item_log as:
+        {"step": int, "item_id": str, "delta": int, "total": int}
+    All inventory keys are tracked (not just reward items), so the log can be
+    used to plot the full collection history after the run.
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        item_ids: Optional[List[str]] = None,
+        keep_inventory: bool = True,
+        survival_spec: Optional[SurvivalEnv] = None,
+    ):
+        super().__init__(env)
+        self._reward_items: List[RewardItem] = (
+            [get_reward_item(i) for i in item_ids]
+            if item_ids is not None
+            else list(MASTER_REWARD_TABLE)
+        )
+        self._prev_inventory: dict = {}
+        self._rewarded: dict = {}
+
+        self._keep_inventory = keep_inventory
+        self._survival_spec = survival_spec
+        self._item_log: List[dict] = []
+        self._step_count: int = 0
+        self._prev_full_inventory: Dict[str, int] = {}
+        self._pending_inventory: Optional[Tuple] = None  # set on death, applied on next reset
+
+    @property
+    def item_log(self) -> List[dict]:
+        """List of {"step", "item_id", "delta", "total"} entries — one per pickup event."""
+        return self._item_log
+
+    def _read_counts(self, obs) -> dict:
+        inv = obs["inventory"]
+        return {
+            item.item_id: (
+                sum(int(inv.get(k, 0)) for k in item.variants)
+                if item.variants
+                else int(inv.get(item.item_id, 0))
+            )
+            for item in self._reward_items
+        }
+
+    def _read_full_inventory(self, obs) -> Dict[str, int]:
+        return {k: int(v) for k, v in obs["inventory"].items() if int(v) > 0}
+
+    def reset(self):
+        # Restore inventory from the previous death before Malmo gets the new mission
+        if self._keep_inventory and self._pending_inventory is not None:
+            if self._survival_spec is not None:
+                self._survival_spec.set_start_inventory(self._pending_inventory)
+            self._pending_inventory = None
+
+        obs = self.env.reset()
+        self._prev_inventory = self._read_counts(obs)
+        self._rewarded = {item.item_id: 0 for item in self._reward_items}
+        self._prev_full_inventory = self._read_full_inventory(obs)
+        return obs
+
+    def step(self, action):
+        obs, _, done, info = self.env.step(action)
+        self._step_count += 1
+        reward = 0.0
+
+        # ── Full-inventory delta → item log ───────────────────────────────────
+        full_current = self._read_full_inventory(obs)
+        for item_id in set(self._prev_full_inventory) | set(full_current):
+            prev_qty = self._prev_full_inventory.get(item_id, 0)
+            curr_qty = full_current.get(item_id, 0)
+            if curr_qty > prev_qty:
+                self._item_log.append({
+                    "step":    self._step_count,
+                    "item_id": item_id,
+                    "delta":   curr_qty - prev_qty,
+                    "total":   curr_qty,
+                })
+        self._prev_full_inventory = full_current
+
+        # ── Save inventory on death for next reset ────────────────────────────
+        if done and self._keep_inventory:
+            self._pending_inventory = tuple(
+                (item_id, qty) for item_id, qty in full_current.items()
+            )
+
+        # ── Reward computation (reward items only) ────────────────────────────
+        current = self._read_counts(obs)
+        for item in self._reward_items:
+            prev = self._prev_inventory[item.item_id]
+            curr = current[item.item_id]
+            new_items = max(0, curr - prev)
+
+            if new_items > 0:
+                already = self._rewarded[item.item_id]
+                if item.max_qty == float("inf"):
+                    reward += item.reward_per_item * new_items
+                    self._rewarded[item.item_id] = already + new_items
+                else:
+                    rewardable = max(0, min(already + new_items, item.max_qty) - already)
+                    reward += item.reward_per_item * rewardable
+                    self._rewarded[item.item_id] = min(already + new_items, item.max_qty)
+
+            self._prev_inventory[item.item_id] = curr
+
+        return obs, reward, done, info
+</file>
+
+<file path="envs/tree_flat_env.py">
+from typing import List
+
+import minerl.herobraine.hero.handlers as handlers
+from minerl.herobraine.env_specs.human_survival_specs import HumanSurvival
+from minerl.herobraine.hero.handler import Handler
+from minerl.herobraine.hero.handlers.server.world import FlatWorldGenerator
+
+
+class DrawingDecorator(Handler):
+    """DrawingDecorator that bypasses Jinja2 autoescape by overriding xml()."""
+
+    def __init__(self, to_draw: str):
+        self.to_draw = to_draw
+
+    def xml(self) -> str:
+        return f"<DrawingDecorator>{self.to_draw}</DrawingDecorator>"
+
+    def xml_template(self) -> str:
+        return "<DrawingDecorator>{{ to_draw }}</DrawingDecorator>"
+
+    def to_string(self) -> str:
+        return "drawing_decorator"
+
+# ── Tree definitions ───────────────────────────────────────────────────────────
+# Each entry: (log_type, leaf_type)
+TREE_TYPES = [
+    ("minecraft:oak_log",      "minecraft:oak_leaves"),
+    ("minecraft:birch_log",    "minecraft:birch_leaves"),
+    ("minecraft:spruce_log",   "minecraft:spruce_leaves"),
+    ("minecraft:jungle_log",   "minecraft:jungle_leaves"),
+    ("minecraft:acacia_log",   "minecraft:acacia_leaves"),
+    ("minecraft:dark_oak_log", "minecraft:dark_oak_leaves"),
+    ("minecraft:dirt")
+]
+
+# Superflat: bedrock at y=0, 2x dirt y=1-2, grass at y=3 → trees start at y=4
+GROUND_Y = 3
+TRUNK_HEIGHT = 5   # y=4 .. y=8
+LEAF_RADIUS = 2    # leaves extend ±2 blocks in X/Z
+LEAF_Y_START = 6   # leaves start 2 below treetop
+LEAF_Y_END   = GROUND_Y + TRUNK_HEIGHT + 1  # y=9
+
+TREE_SPACING = 7   # blocks between trunks
+GRID_RADIUS  = 4   # trees from -GRID_RADIUS to +GRID_RADIUS  → 9×9 = 81 trees
+
+
+def _cuboid(x1, y1, z1, x2, y2, z2, block: str) -> str:
+    return (
+        f'<DrawCuboid x1="{x1}" y1="{y1}" z1="{z1}"'
+        f' x2="{x2}" y2="{y2}" z2="{z2}" type="{block}"/>'
+    )
+
+
+def _build_tree_xml() -> str:
+    parts = []
+    tree_index = 0
+    for gx in range(-GRID_RADIUS, GRID_RADIUS + 1):
+        for gz in range(-GRID_RADIUS, GRID_RADIUS + 1):
+            # Skip centre so the agent spawns in a clearing
+            if gx == 0 and gz == 0:
+                continue
+
+            x = gx * TREE_SPACING
+            z = gz * TREE_SPACING
+            log, leaf = TREE_TYPES[tree_index % len(TREE_TYPES)]
+            tree_index += 1
+
+            trunk_top = GROUND_Y + TRUNK_HEIGHT
+            # Trunk
+            parts.append(_cuboid(x, GROUND_Y + 1, z, x, trunk_top, z, log))
+            # Leaves
+            parts.append(_cuboid(
+                x - LEAF_RADIUS, LEAF_Y_START, z - LEAF_RADIUS,
+                x + LEAF_RADIUS, LEAF_Y_END,   z + LEAF_RADIUS,
+                leaf,
+            ))
+
+    return "".join(parts)
+
+
+class TreeFlatEnv(HumanSurvival):
+    """
+    Superflat world densely planted with all six wood types on a regular grid.
+    Designed as a simplified curriculum environment for log-harvesting tasks.
+    """
+
+    def __init__(self, **kwargs):
+        if "name" not in kwargs:
+            kwargs["name"] = "MineRLTreeFlat-v0"
+        super().__init__(**kwargs)
+
+    def create_server_world_generators(self) -> List[Handler]:
+        # Empty generatorString → Malmo default flat (bedrock/dirt/grass)
+        return [FlatWorldGenerator(force_reset=True, generatorString="")]
+
+    def create_server_decorators(self) -> List[Handler]:
+        return [DrawingDecorator(_build_tree_xml())]
+
+    def create_agent_start(self) -> List[Handler]:
+        return super().create_agent_start() + [
+            handlers.InventoryAgentStart({
+                0: {"type": "iron_shovel", "quantity": 1},
+            })
+        ]
+
+    def create_server_initial_conditions(self) -> List[Handler]:
+        return [
+            handlers.TimeInitialCondition(allow_passage_of_time=True, start_time=6000),
+            handlers.SpawningInitialCondition(allow_spawning=False),  # no hostile mobs
+        ]
+</file>
+
+<file path="config.py">
+import os
+import time
+from dataclasses import dataclass, field
+from typing import List
+
+
+# ── Item variant lists ────────────────────────────────────────────────────────
+# All inventory keys that map to a single logical item.
+
+LOG_VARIANTS: List[str] = [
+    "oak_log",    "birch_log",    "spruce_log",
+    "jungle_log", "acacia_log",   "dark_oak_log",
+    "oak_wood",   "birch_wood",   "spruce_wood",
+    "jungle_wood","acacia_wood",  "dark_oak_wood",
+]
+
+PLANK_VARIANTS: List[str] = [
+    "oak_planks",    "birch_planks",    "spruce_planks",
+    "jungle_planks", "acacia_planks",   "dark_oak_planks",
+    "planks",   # fallback for older MineRL versions
+]
+
+
+# ── Reward item ───────────────────────────────────────────────────────────────
+
+@dataclass
+class RewardItem:
+    """
+    One rewarded item.
+
+    item_id         Logical key used in reward tables and tasks.
+    display_name    Human-readable label (for logs / TensorBoard).
+    max_qty         Maximum quantity that earns reward; float('inf') = uncapped.
+    reward_per_item Reward given per newly collected unit (up to max_qty).
+    variants        All inventory keys that count toward this item.
+                    Leave empty when item_id matches the inventory key directly.
+    """
+    item_id: str
+    display_name: str
+    max_qty: float
+    reward_per_item: float
+    variants: List[str] = field(default_factory=list)
+
+
+# ── Master reward table ───────────────────────────────────────────────────────
+# Source of truth for all rewarded items (based on VPT paper, Table 7).
+# To add a new item: append a RewardItem entry here.
+# To change the reward: edit max_qty or reward_per_item.
+# Tasks reference items by item_id.
+
+MASTER_REWARD_TABLE: List[RewardItem] = [
+    # ── Wood & crafting basics ──────────────────────────────────────────
+    RewardItem("log",             "Log",              max_qty=8,            reward_per_item=1/8,  variants=LOG_VARIANTS),
+    RewardItem("planks",          "Planks",           max_qty=20,           reward_per_item=1/20, variants=PLANK_VARIANTS),
+    RewardItem("stick",           "Stick",            max_qty=16,           reward_per_item=1/16),
+    RewardItem("crafting_table",  "Crafting Table",   max_qty=1,            reward_per_item=1.0),
+    # ── Stone tier ─────────────────────────────────────────────────────
+    RewardItem("cobblestone",     "Cobblestone",      max_qty=11,           reward_per_item=1/11),
+    RewardItem("wooden_pickaxe",  "Wooden Pickaxe",   max_qty=1,            reward_per_item=1.0),
+    RewardItem("stone_pickaxe",   "Stone Pickaxe",    max_qty=1,            reward_per_item=1.0),
+    # ── Utility ────────────────────────────────────────────────────────
+    RewardItem("furnace",         "Furnace",          max_qty=1,            reward_per_item=1.0),
+    RewardItem("coal",            "Coal",             max_qty=5,            reward_per_item=2/5),
+    RewardItem("torch",           "Torch",            max_qty=16,           reward_per_item=1/8),
+    # ── Iron tier ──────────────────────────────────────────────────────
+    RewardItem("iron_ore",        "Iron Ore",         max_qty=3,            reward_per_item=4/3),
+    RewardItem("iron_ingot",      "Iron Ingot",       max_qty=3,            reward_per_item=4/3),
+    RewardItem("iron_pickaxe",    "Iron Pickaxe",     max_qty=1,            reward_per_item=4.0),
+    # ── Diamond tier (uncapped) ─────────────────────────────────────────
+    RewardItem("diamond",         "Diamond",          max_qty=float("inf"), reward_per_item=8/3),
+    RewardItem("diamond_pickaxe", "Diamond Pickaxe",  max_qty=float("inf"), reward_per_item=8.0),
+    # ── Basic blocks ────────────────────────────────────────────────────
+    RewardItem("dirt",            "Dirt",             max_qty=float("inf"), reward_per_item=1.0),
+]
+
+_REWARD_INDEX: dict = {item.item_id: item for item in MASTER_REWARD_TABLE}
+
+
+def get_reward_item(item_id: str) -> RewardItem:
+    """Return the RewardItem for item_id. Raises KeyError if not in MASTER_REWARD_TABLE."""
+    return _REWARD_INDEX[item_id]
+
+
+# ── Task definition ───────────────────────────────────────────────────────────
+
+@dataclass
+class TaskSpec:
+    """
+    A single training task.
+
+    name               Short identifier used for filenames / logging.
+    display_name       Human-readable label.
+    item_reward_keys   Items from MASTER_REWARD_TABLE to reward during this task.
+    goal_key           Item whose acquisition completes this task, OR "reward_based"
+                       for obtain tasks that complete when max_reward is accumulated.
+    action_reward_key  Action key in env_action dict whose press toggles the UI open/closed.
+                       Empty string means no action reward.
+    action_reward      Reward given per step while the UI is open.
+    """
+    name: str
+    display_name: str
+    item_reward_keys: List[str]
+    goal_key: str
+    action_reward_key: str = ""
+    action_reward: float = 0.01
+    disable_movement: bool = False
+
+    @property
+    def task_type(self) -> str:
+        """'obtain' for reward-based completion, 'craft' for item-acquisition completion."""
+        return "obtain" if self.goal_key == "reward_based" else "craft"
+
+    @property
+    def reward_items(self) -> List[RewardItem]:
+        return [get_reward_item(k) for k in self.item_reward_keys]
+
+    @property
+    def max_reward(self) -> float:
+        """Maximum reward achievable for this task (used by obtain tasks as completion threshold)."""
+        return sum(
+            item.max_qty * item.reward_per_item
+            for item in self.reward_items
+            if item.max_qty != float("inf")
+        )
+
+
+# ── Curriculum ────────────────────────────────────────────────────────────────
+# Ordered list of tasks for sequential training.
+# Add, remove, or reorder tasks here to change the curriculum.
+
+TASKS: List[TaskSpec] = [
+    TaskSpec(
+        name="obtain_wood",
+        display_name="Obtain Wood",
+        item_reward_keys=["log"],
+        goal_key="reward_based",
+    ),
+    TaskSpec(
+        name="craft_wood_items",
+        display_name="Craft Wooden Items",
+        item_reward_keys=["stick", "crafting_table"],
+        goal_key="crafting_table",
+        action_reward_key="inventory",  # E opens the 2x2 crafting grid
+        action_reward=0.001,
+        disable_movement=True,
+    ),
+    TaskSpec(
+        name="craft_wooden_pickaxe",
+        display_name="Craft Wooden Pickaxe",
+        item_reward_keys=["wooden_pickaxe"],
+        goal_key="wooden_pickaxe",
+        disable_movement=True,
+    ),
+    TaskSpec(
+        name="obtain_stone",
+        display_name="Obtain Stone",
+        item_reward_keys=["cobblestone"],
+        goal_key="reward_based",
+    ),
+    TaskSpec(
+        name="craft_stone_pickaxe",
+        display_name="Craft Stone Pickaxe",
+        item_reward_keys=["stone_pickaxe"],
+        goal_key="stone_pickaxe",
+    ),
+]
+
+
+# ── Training configuration ────────────────────────────────────────────────────
+
+_MODELS = os.environ.get("VPT_MODELS", "/workspace/models")
+_LOGS   = os.environ.get("VPT_LOGS",   "/workspace/logs")
+_TASK_INVENTORIES = os.environ.get("VPT_TASK_INVENTORIES", "/workspace/task_inventories")
+
+
+@dataclass(frozen=True)
+class PPOConfig:
+    # ── Training mode ──────────────────────────────────────────────────
+    # "sequential"  train on TASKS curriculum (sequential_env)
+    # "single"      train on a flat reward for single_task_items only
+    mode: str = "sequential"
+    # item_ids to reward in "single" mode (must exist in MASTER_REWARD_TABLE)
+    single_task_items: tuple = ("log",)
+    # If True, stay on the current task after completion instead of advancing
+    train_on_repeat: bool = True
+
+    # ── Rollout ────────────────────────────────────────────────────────
+    # "fixed"            collect exactly n_steps, always update
+    # "reward_triggered" collect until reward > 0 or max_steps_no_reward
+    update_mode: str = "fixed"
+    n_steps: int = 256
+    max_steps_no_reward: int = 4096
+
+    # ── PPO hyperparameters ────────────────────────────────────────────
+    n_epochs: int = 1
+    batch_size: int = 64
+    gamma: float = 0.999
+    gae_lambda: float = 0.95
+    clip_range: float = 0.2
+    ent_coef: float = 0.01
+    vf_coef: float = 0.5
+    max_grad_norm: float = 5.0
+    target_kl: float = 0.02
+
+    # ── KL regularization vs frozen pretrained policy ──────────────────
+    kl_pretrained_coef: float = 0.2
+    kl_pretrained_coef_decay: float = 0.9995
+
+    # ── Optimizer ──────────────────────────────────────────────────────
+    learning_rate: float = 2e-5
+    weight_decay: float = 0.001
+
+    # ── Model paths ────────────────────────────────────────────────────
+    # Override via VPT_MODELS env var or pass explicitly to PPOConfig().
+    model_path: str = field(default_factory=lambda: os.path.join(_MODELS, "foundation-model-1x.model"))
+    weights_path: str = field(default_factory=lambda: os.path.join(_MODELS, "foundation-model-1x.weights"))
+    pretrained_weights_path: str = field(default_factory=lambda: os.path.join(_MODELS, "foundation-model-1x.weights"))
+    task_weights_dir: str = field(default_factory=lambda: os.path.join(_MODELS, "task_weights"))
+    task_inventories_dir: str = field(default_factory=lambda: _TASK_INVENTORIES)
+
+    # ── Curriculum start ───────────────────────────────────────────────
+    # start_task:      name of the task to begin from (skips earlier tasks).
+    #                  Must match a TaskSpec.name in TASKS. "" = start from first task.
+    # start_inventory: items to place in the agent's inventory at episode start.
+    #                  Tuple of (minecraft_item_id, quantity) pairs.
+    #                  Use actual MC item IDs (e.g. "oak_log", not the aggregated "log").
+    #                  Example: (("oak_log", 8), ("stick", 4))
+    start_task: str = "craft_wood_items"
+    start_inventory: tuple = (("spruce_log", 8),)
+
+    # ── Training length ────────────────────────────────────────────────
+    episodes: int = 20
+    total_timesteps: int = 1000
+    world_seed: int = 42
+
+    # ── Live stream ────────────────────────────────────────────────────
+    stream_enabled: bool = True
+    stream_port: int = 8080
+    stream_fps: int = 40
+
+    # ── Video / TensorBoard logging ────────────────────────────────────
+    record_every_n_updates: int = 999999
+    video_fps: int = 20
+    log_dir: str = field(default_factory=lambda: os.path.join(_LOGS, f"run_{int(time.time())}"))
+</file>
+
+<file path="eval.py">
+"""
+Evaluation script — run a trained agent, record a video, and log item collection.
+
+Usage
+-----
+    python eval.py                        # uses config defaults
+    python eval.py --weights /path/to/model.weights
+    python eval.py --steps 2000
+    python eval.py --out /workspace/logs/eval_run
+    python eval.py --no_keep_inventory    # drop items on death (default: keep)
+    python eval.py --no_video             # skip video recording
+
+Environment variables
+---------------------
+    VPT_MODELS   directory with .model / .weights files  (default /workspace/models)
+
+Outputs
+-------
+    <out_dir>/eval.mp4       video of the run (unless --no_video)
+    <out_dir>/item_log.csv   step,item_id,delta,total — written live during the run
+"""
+
+import sys
+import os
+import argparse
+import csv
+from collections import defaultdict
+
+sys.path.insert(0, '/workspace/vpt')
+
+import cv2
+import torch as th
+
+from agent import ENV_KWARGS
+from config import PPOConfig
+from training_utils import build_policy, make_action_transformer
+from envs.survival_env import SurvivalEnv, SurvivalRewardEnv
+from vpt_actor import VPTActor
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Evaluate a trained VPT agent")
+    p.add_argument("--weights",           default=None,  help="Path to .weights file")
+    p.add_argument("--steps",             default=100000,  type=int)
+    p.add_argument("--out",               default=None,  help="Output directory (default: <log_dir>)")
+    p.add_argument("--fps",               default=20,    type=int)
+    p.add_argument("--no_keep_inventory", action="store_true",
+                   help="Drop items on death (default: inventory is kept)")
+    p.add_argument("--no_video",          action="store_true",
+                   help="Skip video recording")
+    return p.parse_args()
+
+
+def _print_summary(csv_path: str) -> None:
+    totals = defaultdict(int)
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            totals[row["item_id"]] += int(row["delta"])
+    print("[eval] Items collected:")
+    for item_id, qty in sorted(totals.items(), key=lambda x: -x[1]):
+        print(f"         {item_id:30s} {qty:4d}")
+
+
+def main():
+    args = parse_args()
+    config = PPOConfig()
+    device = th.device("cuda" if th.cuda.is_available() else "cpu")
+
+    weights = args.weights or config.weights_path
+    out_dir = args.out or config.log_dir
+    os.makedirs(out_dir, exist_ok=True)
+
+    keep_inventory = not args.no_keep_inventory
+
+    # Build env directly (not via make_env) to keep the spec reference
+    # needed for inventory restoration on death.
+    spec = SurvivalEnv(**ENV_KWARGS)
+    base = spec.make()
+    env  = SurvivalRewardEnv(base, keep_inventory=keep_inventory, survival_spec=spec)
+
+    policy, action_mapper = build_policy(config, device, weights_path=weights)
+    actor = VPTActor(policy, action_mapper, make_action_transformer(), device)
+
+    # ── Video writer (optional) ───────────────────────────────────────────────
+    video = None
+    if not args.no_video:
+        video_path = os.path.join(out_dir, "eval.mp4")
+        video = cv2.VideoWriter(video_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                args.fps, (128, 128))
+
+    # ── Item log: open CSV once and append rows live during the run ───────────
+    csv_path = os.path.join(out_dir, "item_log.csv")
+    csv_file = open(csv_path, "w", newline="")
+    csv_writer = csv.DictWriter(csv_file, fieldnames=["step", "item_id", "delta", "total"])
+    csv_writer.writeheader()
+    csv_file.flush()
+    log_cursor = 0  # index into env.item_log up to which we've already written
+
+    policy.eval()
+    obs = env.reset()
+    hidden = actor.get_initial_hidden_state()
+    done = False
+    total_reward = 0.0
+    death_count  = 0
+    bar_width    = 40
+
+    print(f"[eval] Running {args.steps} steps  weights={weights}"
+          f"  keep_inventory={keep_inventory}  video={not args.no_video}")
+    print(f"[eval] Item log → {csv_path}")
+
+    for step in range(args.steps):
+        env_action, _, _, _, hidden, frame = actor.step(obs, hidden, done)
+        obs, reward, done, info = env.step(env_action)
+
+        if video is not None:
+            video.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+
+        total_reward += reward
+
+        # Write any new item log entries that appeared this step
+        new_entries = env.item_log[log_cursor:]
+        if new_entries:
+            csv_writer.writerows(new_entries)
+            csv_file.flush()
+            log_cursor += len(new_entries)
+
+        filled = int(bar_width * min(max(total_reward, 0), bar_width) / bar_width)
+        bar = "#" * filled + "-" * (bar_width - filled)
+        print(f"\rstep {step+1:5d}  reward={reward:+.3f}  total=[{bar}] {total_reward:.2f}"
+              f"  deaths={death_count}", end="", flush=True)
+
+        if done:
+            death_count += 1
+            obs = env.reset()
+            hidden = actor.get_initial_hidden_state()
+            done = False
+
+    print(f"\n[eval] Total reward: {total_reward:.2f}  deaths: {death_count}")
+
+    csv_file.close()
+    env.close()
+
+    if video is not None:
+        video.release()
+        print(f"[eval] Video    → {video_path}")
+
+    _print_summary(csv_path)
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="live_stream.py">
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Optional
+
+import cv2
+import numpy as np
+
+
+class _StreamHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # suppress request logs
+
+    def do_GET(self):
+        if self.path != "/":
+            self.send_error(404)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.end_headers()
+
+        while True:
+            frame = self.server.streamer.get_frame()
+            if frame is None:
+                time.sleep(0.05)
+                continue
+
+            _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            data = jpeg.tobytes()
+            try:
+                self.wfile.write(
+                    f"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {len(data)}\r\n\r\n".encode()
+                    + data
+                    + b"\r\n"
+                )
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                break
+
+            time.sleep(1 / self.server.streamer.fps)
+
+
+class LiveStreamer:
+    """
+    Streams obs['pov'] frames as MJPEG over HTTP.
+
+    Usage:
+        streamer = LiveStreamer(port=8080, fps=10)
+        streamer.start()
+        # inside rollout loop:
+        streamer.push_frame(obs["pov"])
+    """
+
+    def __init__(self, port: int = 8080, fps: int = 10):
+        self.port = port
+        self.fps = fps
+        self._frame: Optional[np.ndarray] = None
+        self._lock = threading.Lock()
+        self._server: Optional[HTTPServer] = None
+
+    def push_frame(self, frame: np.ndarray):
+        """Push a new RGB frame (H, W, 3) uint8 — called from the training loop."""
+        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        with self._lock:
+            self._frame = bgr
+
+    def get_frame(self) -> Optional[np.ndarray]:
+        with self._lock:
+            return self._frame.copy() if self._frame is not None else None
+
+    def start(self):
+        """Start the HTTP server in a daemon thread."""
+        server = HTTPServer(("0.0.0.0", self.port), _StreamHandler)
+        server.streamer = self
+        self._server = server
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        print(f"[LiveStreamer] Stream available at http://localhost:{self.port}")
+</file>
+
+<file path="ppo_updater.py">
+import sys
+sys.path.insert(0, '/workspace/vpt')
+
+import numpy as np
+import torch as th
+import torch.nn.functional as F
+
+from lib.tree_util import tree_map
+
+
+class PPOUpdater:
+    """Runs PPO gradient updates over a filled VPTRolloutBuffer."""
+
+    def __init__(self, policy, optimizer, config, pretrained_policy=None):
+        self.policy = policy
+        self.optimizer = optimizer
+        self.config = config
+        self.pretrained_policy = pretrained_policy  # frozen reference; None → use entropy bonus
+        self.kl_coef = config.kl_pretrained_coef
+
+    def decay_kl_coef(self):
+        """Call once per iteration to decay the KL coefficient."""
+        self.kl_coef *= self.config.kl_pretrained_coef_decay
+
+    def _compute_kl_vs_pretrained(self, obs_seq: th.Tensor, first_seq: th.Tensor,
+                                   pi_logits_current: dict) -> th.Tensor:
+        """
+        KL(π_pretrained || π_current) over the full rollout sequence.
+        Runs the pretrained policy with the correct LSTM state threading.
+        obs_seq:  (1, n, H, W, C)
+        first_seq: (1, n) bool — True resets the LSTM hidden state
+        pi_logits_current: dict of (n, ...) — already flattened from (1, n, ...)
+        """
+        with th.no_grad():
+            state_in_pt = self.pretrained_policy.initial_state(1)
+            (pi_logits_pt, _, _), _ = self.pretrained_policy(
+                obs={"img": obs_seq}, first=first_seq, state_in=state_in_pt
+            )
+            # (1, n, ...) → (n, ...)
+            pi_logits_pt_flat = tree_map(lambda x: x[0], pi_logits_pt)
+
+        total_kl = th.tensor(0.0, device=obs_seq.device)
+        for key in pi_logits_pt_flat:
+            lp = pi_logits_pt_flat[key].float()     # pretrained logits (n, ...)
+            lq = pi_logits_current[key].float()     # current policy logits (n, ...)
+            log_p = F.log_softmax(lp, dim=-1)
+            log_q = F.log_softmax(lq, dim=-1)
+            p = log_p.exp()
+            total_kl = total_kl + (p * (log_p - log_q)).sum(dim=-1).mean()
+
+        return total_kl
+
+    def update(self, buffer) -> dict:
+        """
+        PPO update over the full rollout as one ordered sequence (B=1, T=n).
+
+        Processes all n steps in temporal order so the LSTM hidden state is
+        threaded correctly — episode boundaries in buffer.dones are converted
+        to 'first' flags that reset the hidden state at each new episode.
+        This ensures new_log_prob ≈ old_log_prob at the start of each update
+        (approx_kl ≈ 0), which was impossible with the previous shuffled
+        minibatch approach that used initial_state for every sample.
+        """
+        cfg = self.config
+        n = buffer.pos
+        device = next(self.policy.parameters()).device
+
+        # ── Build full-sequence tensors ───────────────────────────────────────
+        obs_np = buffer.obs_imgs[:n].astype(np.float32) / 255.0  # (n, H, W, C)
+        obs_seq = th.from_numpy(obs_np).to(device).unsqueeze(0)  # (1, n, H, W, C)
+
+        # first[t]=True → reset LSTM hidden state at step t
+        # Step 0 always resets; subsequent steps reset after a done.
+        first_np = np.zeros(n, dtype=bool)
+        first_np[0] = True
+        if n > 1:
+            first_np[1:] = buffer.dones[:n - 1].astype(bool)
+        first_seq = th.from_numpy(first_np).to(device).unsqueeze(0)  # (1, n)
+
+        old_log_probs = th.from_numpy(buffer.log_probs[:n]).to(device)   # (n,)
+        advantages    = th.from_numpy(buffer.advantages[:n]).to(device)  # (n,)
+        advantages    = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        returns_seq   = th.from_numpy(buffer.returns[:n]).to(device)     # (n,)
+
+        agent_action = {
+            "buttons": th.from_numpy(buffer.buttons[:n]).to(device),  # (n, 1)
+            "camera":  th.from_numpy(buffer.cameras[:n]).to(device),  # (n, 1)
+        }
+
+        all_policy_losses, all_value_losses, all_entropies, all_kls, all_kl_pt = [], [], [], [], []
+
+        for _ in range(cfg.n_epochs):
+            # ── Sequential forward pass — LSTM threads through all n steps ──
+            state_in = self.policy.initial_state(1)
+            (pi_logits, vpred_raw, _), _ = self.policy(
+                obs={"img": obs_seq}, first=first_seq, state_in=state_in
+            )
+            # pi_logits: dict of (1, n, ...) → treat timesteps as batch dim → (n, ...)
+            pi_logits_flat = tree_map(lambda x: x[0], pi_logits)
+            # vpred_raw: (1, n, 1)
+
+            new_log_prob = self.policy.get_logprob_of_action(pi_logits_flat, agent_action)  # (n,)
+            entropy = self.policy.pi_head.entropy(pi_logits_flat).mean()
+
+            # ── PPO clip loss ─────────────────────────────────────────────────
+            ratio = th.exp(new_log_prob - old_log_probs)
+            policy_loss = th.max(
+                -advantages * ratio,
+                -advantages * th.clamp(ratio, 1.0 - cfg.clip_range, 1.0 + cfg.clip_range),
+            ).mean()
+
+            # ── Value loss — vpred: (1, n, 1), target: (1, n, 1) ─────────────
+            value_loss = self.policy.value_head.loss(
+                vpred_raw,
+                returns_seq.unsqueeze(0).unsqueeze(-1),
+            )
+
+            # ── Regularization: KL vs. pretrained (or entropy fallback) ──────
+            if self.pretrained_policy is not None:
+                kl_pt = self._compute_kl_vs_pretrained(obs_seq, first_seq, pi_logits_flat)
+                loss = policy_loss + cfg.vf_coef * value_loss + self.kl_coef * kl_pt
+                all_kl_pt.append(kl_pt.item())
+            else:
+                loss = policy_loss + cfg.vf_coef * value_loss - cfg.ent_coef * entropy
+                all_kl_pt.append(0.0)
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            th.nn.utils.clip_grad_norm_(self.policy.parameters(), cfg.max_grad_norm)
+            self.optimizer.step()
+
+            # ── Logging / early stop ──────────────────────────────────────────
+            with th.no_grad():
+                log_ratio = new_log_prob - old_log_probs
+                approx_kl = ((th.exp(log_ratio) - 1) - log_ratio).mean().item()
+
+            all_policy_losses.append(policy_loss.item())
+            all_value_losses.append(value_loss.item())
+            all_entropies.append(entropy.item())
+            all_kls.append(approx_kl)
+
+            if cfg.target_kl is not None and approx_kl > cfg.target_kl:
+                break
+
+        return {
+            "policy_loss":   float(np.mean(all_policy_losses)),
+            "value_loss":    float(np.mean(all_value_losses)),
+            "entropy":       float(np.mean(all_entropies)),
+            "approx_kl":     float(np.mean(all_kls)),
+            "kl_pretrained": float(np.mean(all_kl_pt)),
+        }
+</file>
+
+<file path="rollout_buffer.py">
+from typing import Generator
+
+import numpy as np
+import torch as th
+
+
+class VPTRolloutBuffer:
+    """
+    Stores transitions of (obs, action, reward, done, value, log_prob) and
+    computes GAE advantages + lambda-returns.
+
+    capacity  – maximum number of steps that can be stored (pre-allocated).
+    Actual used size is tracked via self.pos; finalize() and get() operate
+    only on the filled portion [0 : self.pos].
+    """
+
+    def __init__(self, capacity: int, image_shape: tuple, gamma: float, gae_lambda: float, device):
+        self.capacity = capacity
+        self.image_shape = image_shape  # (H, W, C)
+        self.gamma = gamma
+        self.gae_lambda = gae_lambda
+        self.device = device
+        self.pos = 0
+
+        H, W, C = image_shape
+        self.obs_imgs = np.zeros((capacity, H, W, C), dtype=np.uint8)
+        self.buttons = np.zeros((capacity, 1), dtype=np.int64)
+        self.cameras = np.zeros((capacity, 1), dtype=np.int64)
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.dones = np.zeros(capacity, dtype=np.float32)
+        self.values = np.zeros(capacity, dtype=np.float32)
+        self.log_probs = np.zeros(capacity, dtype=np.float32)
+        self.advantages = np.zeros(capacity, dtype=np.float32)
+        self.returns = np.zeros(capacity, dtype=np.float32)
+
+    @property
+    def full(self) -> bool:
+        return self.pos >= self.capacity
+
+    def reset(self):
+        self.pos = 0
+
+    def add(self, obs_img: np.ndarray, agent_action: dict, reward: float,
+            done: bool, value: float, log_prob: float):
+        """Store one transition. obs_img must be (H, W, C) uint8."""
+        assert self.pos < self.capacity, "Buffer is full – call reset() first."
+        t = self.pos
+        self.obs_imgs[t] = obs_img
+        self.buttons[t] = agent_action["buttons"].cpu().numpy()
+        self.cameras[t] = agent_action["camera"].cpu().numpy()
+        self.rewards[t] = reward
+        self.dones[t] = float(done)
+        self.values[t] = value
+        self.log_probs[t] = log_prob
+        self.pos += 1
+
+    def finalize(self, last_value: float, last_done: bool):
+        """
+        Compute GAE advantages and lambda-returns for steps [0 : self.pos].
+        Must be called after the rollout is complete.
+        """
+        n = self.pos
+        last_gae_lam = 0.0
+        for t in reversed(range(n)):
+            if t == n - 1:
+                next_non_terminal = 1.0 - float(last_done)
+                next_value = last_value
+            else:
+                next_non_terminal = 1.0 - self.dones[t + 1]
+                next_value = self.values[t + 1]
+            delta = (
+                self.rewards[t]
+                + self.gamma * next_value * next_non_terminal
+                - self.values[t]
+            )
+            last_gae_lam = (
+                delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
+            )
+            self.advantages[t] = last_gae_lam
+        self.returns[:n] = self.advantages[:n] + self.values[:n]
+
+    def get(self, batch_size: int) -> Generator[dict, None, None]:
+        """Yield shuffled minibatches over the filled portion [0 : self.pos]."""
+        n = self.pos
+        indices = np.random.permutation(n)
+        start = 0
+        while start < n:
+            batch_idx = indices[start: start + batch_size]
+            yield {
+                "obs_imgs": self.obs_imgs[batch_idx],       # (B, H, W, C) uint8
+                "buttons": th.from_numpy(self.buttons[batch_idx]).to(self.device),
+                "cameras": th.from_numpy(self.cameras[batch_idx]).to(self.device),
+                "old_log_probs": th.from_numpy(self.log_probs[batch_idx]).to(self.device),
+                "old_values": th.from_numpy(self.values[batch_idx]).to(self.device),
+                "advantages": th.from_numpy(self.advantages[batch_idx]).to(self.device),
+                "returns": th.from_numpy(self.returns[batch_idx]).to(self.device),
+            }
+            start += batch_size
+</file>
+
+<file path="train.py">
+"""
+Single entry point for PPO training.
+
+Quick start
+-----------
+    python train.py                              # sequential curriculum, defaults
+    python train.py --mode single                # single-task log harvesting
+    python train.py --update_mode reward_triggered --total_timesteps 200000
+    python train.py --mode single --single_task_items log planks
+
+Environment variables
+---------------------
+    VPT_MODELS   directory containing .model and .weights files  (default /workspace/models)
+    VPT_LOGS     directory for TensorBoard logs and checkpoints  (default /workspace/logs)
+"""
+
+import sys
+import os
+import json
+import argparse
+
+sys.path.insert(0, '/workspace/vpt')
+
+import torch as th
+
+from config import PPOConfig, TASKS
+from training_utils import (
+    build_policy, build_frozen_policy, make_action_transformer, make_env,
+    find_latest_weights, suppress_movement_in_policy,
+)
+from vpt_actor import VPTActor
+from rollout_buffer import VPTRolloutBuffer
+from ppo_updater import PPOUpdater
+from video_logger import VideoLogger
+from live_stream import LiveStreamer
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Train VPT agent with PPO")
+    p.add_argument("--mode",              default=None,  choices=["sequential", "single"],
+                   help="Training mode (default: sequential)")
+    p.add_argument("--single_task_items", default=None,  nargs="+",
+                   help="Items to reward in single mode, e.g. --single_task_items log planks")
+    p.add_argument("--update_mode",       default=None,  choices=["fixed", "reward_triggered"])
+    p.add_argument("--n_steps",           default=None,  type=int)
+    p.add_argument("--total_timesteps",   default=None,  type=int)
+    p.add_argument("--episodes",           default=None,  type=int,
+                   help="Stop after this many episodes (0 = use total_timesteps only)")
+    p.add_argument("--learning_rate",     default=None,  type=float)
+    p.add_argument("--task_weights_dir",  default=None,
+                   help="Directory for per-task weight files (overrides config.task_weights_dir)")
+    p.add_argument("--log_dir",           default=None)
+    p.add_argument("--stream_port",       default=None,  type=int)
+    p.add_argument("--stream_enabled",    default=None,  type=lambda x: x.lower() != "false")
+    return p.parse_args()
+
+
+def config_from_args(args) -> PPOConfig:
+    overrides = {}
+    if args.mode                is not None: overrides["mode"]              = args.mode
+    if args.single_task_items   is not None: overrides["single_task_items"] = tuple(args.single_task_items)
+    if args.update_mode         is not None: overrides["update_mode"]       = args.update_mode
+    if args.n_steps             is not None: overrides["n_steps"]           = args.n_steps
+    if args.total_timesteps     is not None: overrides["total_timesteps"]   = args.total_timesteps
+    if args.episodes            is not None: overrides["episodes"]          = args.episodes
+    if args.learning_rate       is not None: overrides["learning_rate"]     = args.learning_rate
+    if args.task_weights_dir    is not None: overrides["task_weights_dir"]  = args.task_weights_dir
+    if args.log_dir             is not None: overrides["log_dir"]           = args.log_dir
+    if args.stream_port         is not None: overrides["stream_port"]       = args.stream_port
+    if args.stream_enabled      is not None: overrides["stream_enabled"]    = args.stream_enabled
+    return PPOConfig(**overrides)
+
+
+# ── Training loop ─────────────────────────────────────────────────────────────
+
+def _collect_fixed(config, env, actor, buffer, video_logger, streamer,
+                   obs, hidden, done, total_steps):
+    rollout_reward = 0.0
+    completed_task_idx = None
+    inventory_snapshot = {}
+    info = {}
+    for _ in range(config.n_steps):
+        video_logger.add_frame(obs["pov"])
+        streamer.push_frame(obs["pov"])
+
+        env_action, agent_action, log_prob, value, hidden, obs_128 = actor.step(obs, hidden, done)
+        next_obs, reward, done, info = env.step(env_action)
+        buffer.add(obs_128, agent_action, reward, done, value, log_prob)
+
+        if info.get("task_complete") and completed_task_idx is None:
+            completed_task_idx = (
+                info["task_idx"] if info.get("all_tasks_complete")
+                else info["task_idx"] - 1
+            )
+            inventory_snapshot = info.get("inventory_snapshot", {})
+
+        rollout_reward += reward
+        total_steps += 1
+        obs = next_obs
+
+        if done:
+            obs, hidden, done = _handle_done(env, actor, info, total_steps)
+
+    return obs, hidden, done, total_steps, rollout_reward, info, completed_task_idx, inventory_snapshot
+
+
+def _collect_reward_triggered(config, env, actor, buffer, video_logger, streamer,
+                               obs, hidden, done, total_steps):
+    rollout_reward = 0.0
+    completed_task_idx = None
+    inventory_snapshot = {}
+    info = {}
+    while not buffer.full and total_steps < config.total_timesteps:
+        video_logger.add_frame(obs["pov"])
+        streamer.push_frame(obs["pov"])
+
+        env_action, agent_action, log_prob, value, hidden, obs_128 = actor.step(obs, hidden, done)
+        next_obs, reward, done, info = env.step(env_action)
+        buffer.add(obs_128, agent_action, reward, done, value, log_prob)
+
+        if info.get("task_complete") and completed_task_idx is None:
+            completed_task_idx = (
+                info["task_idx"] if info.get("all_tasks_complete")
+                else info["task_idx"] - 1
+            )
+            inventory_snapshot = info.get("inventory_snapshot", {})
+
+        rollout_reward += reward
+        total_steps += 1
+        obs = next_obs
+
+        if done:
+            obs, hidden, done = _handle_done(env, actor, info, total_steps)
+
+        if rollout_reward > 0.0:
+            break
+
+    return obs, hidden, done, total_steps, rollout_reward, info, completed_task_idx, inventory_snapshot
+
+
+def _handle_done(env, actor, info, total_steps):
+    if info.get("all_tasks_complete"):
+        print(f"  [Step {total_steps:7d}] All tasks complete!")
+    if info.get("player_died"):
+        print(f"  [Step {total_steps:7d}] Agent died — resetting.")
+    return env.reset(), actor.get_initial_hidden_state(), False
+
+
+def _log_task_events(info: dict, prev_task_idx: int, step: int) -> None:
+    if not info.get("task_complete"):
+        return
+    if info.get("all_tasks_complete"):
+        print(f"  [Step {step:7d}] ✓ Final task '{TASKS[prev_task_idx].display_name}' complete!")
+    else:
+        print(f"  [Step {step:7d}] ✓ '{TASKS[prev_task_idx].display_name}' done "
+              f"→ '{TASKS[info['task_idx']].display_name}'")
+
+
+def _save_task_checkpoint(completed_task_idx, policy, out_dir: str, step: int):
+    if completed_task_idx is None:
+        return
+    task_name = TASKS[completed_task_idx].name
+    path = os.path.join(out_dir, f"task_{completed_task_idx:02d}_{task_name}.weights")
+    th.save(policy.state_dict(), path)
+    print(f"  [Step {step:7d}] Checkpoint saved → {path}")
+
+
+def _save_current_weights(task_idx, policy, out_dir: str):
+    task = TASKS[task_idx]
+    path = os.path.join(out_dir, f"task_{task_idx:02d}_{task.name}_latest.weights")
+    th.save(policy.state_dict(), path)
+
+
+def _maybe_load_task_weights(task_idx, policy, device, task_weights_dir: str) -> bool:
+    path = find_latest_weights(task_idx, task_weights_dir)
+    if path is None:
+        return False
+    policy.load_state_dict(th.load(path, map_location=device), strict=False)
+    print(f"  [Weights] Loaded task {task_idx} weights from {path}")
+    return True
+
+
+def _save_inventory_snapshot(completed_task_idx, inventory_snapshot: dict,
+                              out_dir: str, step: int):
+    if completed_task_idx is None or not inventory_snapshot:
+        return
+    task = TASKS[completed_task_idx]
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"task_{completed_task_idx:02d}_{task.name}_inventory.json")
+    data = {
+        "task_name": task.name,
+        "task_idx": completed_task_idx,
+        "completed_at_step": step,
+        "inventory": inventory_snapshot,
+        "start_inventory": [[k, v] for k, v in inventory_snapshot.items()],
+    }
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"  [Step {step:7d}] Inventory snapshot → {path}")
+
+
+def train(config: PPOConfig) -> None:
+    device = th.device("cuda" if th.cuda.is_available() else "cpu")
+    print(f"[train] device={device}  mode={config.mode}  update_mode={config.update_mode}")
+
+    env = make_env(config)
+
+    policy, action_mapper = build_policy(config, device)
+    frozen_policy = build_frozen_policy(config, device)
+    action_transformer = make_action_transformer()
+
+    # Resume from saved checkpoint if available for the start task
+    start_task_idx = 0
+    if config.mode == "sequential" and config.start_task:
+        names = [t.name for t in TASKS]
+        if config.start_task in names:
+            start_task_idx = names.index(config.start_task)
+    _maybe_load_task_weights(start_task_idx, policy, device, config.task_weights_dir)
+
+    if config.mode == "sequential" and TASKS[start_task_idx].disable_movement:
+        suppress_movement_in_policy(policy)
+
+    actor = VPTActor(policy, action_mapper, action_transformer, device)
+    buffer_capacity = config.n_steps if config.update_mode == "fixed" else config.max_steps_no_reward
+    buffer = VPTRolloutBuffer(
+        capacity=buffer_capacity,
+        image_shape=(128, 128, 3),
+        gamma=config.gamma,
+        gae_lambda=config.gae_lambda,
+        device=device,
+    )
+    optimizer = th.optim.Adam(policy.parameters(), lr=config.learning_rate,
+                               weight_decay=config.weight_decay)
+    updater = PPOUpdater(policy, optimizer, config, pretrained_policy=frozen_policy)
+
+    streamer = LiveStreamer(port=config.stream_port, fps=config.stream_fps)
+    if config.stream_enabled:
+        streamer.start()
+    video_logger = VideoLogger(log_dir=config.log_dir, fps=config.video_fps,
+                                record_every=config.record_every_n_updates)
+
+    os.makedirs(config.log_dir, exist_ok=True)
+    os.makedirs(config.task_weights_dir, exist_ok=True)
+
+    obs = env.reset()
+    hidden = actor.get_initial_hidden_state()
+    done = False
+    total_steps = 0
+    episode_count = 0
+    episode_steps = 0   # steps within the current episode (only used when episodes > 0)
+    update_num = 0
+    total_reward = 0.0
+    prev_task_idx = getattr(env, "task_idx", 0)
+
+    if config.episodes > 0:
+        print(f"[train] Starting — {config.episodes} episodes × {config.total_timesteps:,} steps/episode.")
+    else:
+        print(f"[train] Starting — {config.total_timesteps:,} total steps.")
+    if config.mode == "sequential":
+        print(f"[train] Tasks: {[t.display_name for t in TASKS]}")
+
+    def _not_done() -> bool:
+        if config.episodes > 0:
+            return episode_count < config.episodes
+        return total_steps < config.total_timesteps
+
+    while _not_done():
+        buffer.reset()
+        policy.eval()
+        video_logger.start_rollout(update_num)
+        info = {}
+
+        if config.update_mode == "fixed":
+            obs, hidden, done, total_steps, rollout_reward, info, completed_task_idx, inventory_snapshot = _collect_fixed(
+                config, env, actor, buffer, video_logger, streamer,
+                obs, hidden, done, total_steps,
+            )
+            episode_steps += config.n_steps
+        else:
+            obs, hidden, done, total_steps, rollout_reward, info, completed_task_idx, inventory_snapshot = _collect_reward_triggered(
+                config, env, actor, buffer, video_logger, streamer,
+                obs, hidden, done, total_steps,
+            )
+
+        total_reward += rollout_reward
+
+        _log_task_events(info, prev_task_idx, total_steps)
+        _save_task_checkpoint(completed_task_idx, policy, config.task_weights_dir, total_steps)
+        _save_inventory_snapshot(completed_task_idx, inventory_snapshot, config.task_inventories_dir, total_steps)
+        new_task_idx = info.get("task_idx", prev_task_idx)
+        if completed_task_idx is not None and new_task_idx != prev_task_idx:
+            _maybe_load_task_weights(new_task_idx, policy, device, config.task_weights_dir)
+            if TASKS[new_task_idx].disable_movement:
+                suppress_movement_in_policy(policy)
+        prev_task_idx = new_task_idx
+
+        # GAE
+        _, _, _, last_value, _, _ = actor.step(obs, hidden, done)
+        buffer.finalize(last_value, done)
+
+        if config.update_mode == "reward_triggered" and rollout_reward == 0.0:
+            print(f"[Update {update_num + 1:4d}] Skipping (buffer full, no reward).")
+            update_num += 1
+            continue
+
+        # PPO update
+        policy.train()
+        metrics = updater.update(buffer)
+        updater.decay_kl_coef()
+        update_num += 1
+        _save_current_weights(info.get("task_idx", prev_task_idx), policy, config.task_weights_dir)
+
+        ep_label = f"ep={episode_count + 1}/{config.episodes}  " if config.episodes > 0 else ""
+        task_label = (
+            f"task={info.get('task_idx', 0)}:{TASKS[info['task_idx']].name}"
+            if config.mode == "sequential" and "task_idx" in info
+            else ""
+        )
+        print(
+            f"[Update {update_num:4d} | Steps {total_steps:8d} | {ep_label}{task_label}] "
+            f"policy_loss={metrics['policy_loss']:.4f}  "
+            f"value_loss={metrics['value_loss']:.4f}  "
+            f"approx_kl={metrics['approx_kl']:.4f}  "
+            f"kl_pt={metrics['kl_pretrained']:.4f}  "
+            f"kl_coef={updater.kl_coef:.4f}  "
+            f"rollout_r={rollout_reward:.2f}  total_r={total_reward:.1f}"
+        )
+
+        video_logger.log_metrics(update_num, {
+            **metrics,
+            "rollout_reward": rollout_reward,
+            "total_reward": total_reward,
+            "task_idx": info.get("task_idx", 0),
+        })
+        video_logger.maybe_save_video(update_num)
+
+        if done and info.get("all_tasks_complete"):
+            break
+
+        # Episode boundary: force-reset after total_timesteps steps per episode
+        if config.episodes > 0 and episode_steps >= config.total_timesteps:
+            obs = env.reset()
+            hidden = actor.get_initial_hidden_state()
+            done = False
+            episode_count += 1
+            episode_steps = 0
+            print(f"[Episode {episode_count}/{config.episodes}] Reset after {config.total_timesteps} steps.")
+
+    video_logger.close()
+    env.close()
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+    config = config_from_args(args)
+    train(config)
+
+
+if __name__ == "__main__":
+    main()
+</file>
+
+<file path="training_utils.py">
+"""Shared helpers: policy construction and environment factory."""
+
+import sys
+import os
+import pickle
+from typing import Optional
+
+sys.path.insert(0, '/workspace/vpt')
+
+import torch as th
+from gym3.types import DictType
+
+from agent import ENV_KWARGS
+from lib.action_mapping import CameraHierarchicalMapping
+from lib.actions import ActionTransformer
+from lib.policy import MinecraftAgentPolicy
+
+from config import PPOConfig
+from envs.survival_env import SurvivalEnv, SurvivalRewardEnv
+from envs.sequential_env import SequentialRewardEnv
+
+
+ACTION_TRANSFORMER_KWARGS = dict(
+    camera_binsize=2,
+    camera_maxval=10,
+    camera_mu=10,
+    camera_quantization_scheme="mu_law",
+)
+
+
+def load_model_parameters(path: str) -> tuple:
+    agent_parameters = pickle.load(open(path, "rb"))
+    policy_kwargs = agent_parameters["model"]["args"]["net"]["args"]
+    pi_head_kwargs = agent_parameters["model"]["args"]["pi_head_opts"]
+    pi_head_kwargs["temperature"] = float(pi_head_kwargs["temperature"])
+    return policy_kwargs, pi_head_kwargs
+
+
+def find_latest_weights(task_idx: int, task_weights_dir: str) -> Optional[str]:
+    """Return path to the latest saved weights for task_idx, or None if not found."""
+    from config import TASKS
+    task = TASKS[task_idx]
+    path = os.path.join(task_weights_dir, f"task_{task_idx:02d}_{task.name}_latest.weights")
+    return path if os.path.exists(path) else None
+
+
+def build_policy(config: PPOConfig, device: th.device,
+                 weights_path: str = None) -> tuple:
+    """Build and load a MinecraftAgentPolicy. Returns (policy, action_mapper)."""
+    policy_kwargs, pi_head_kwargs = load_model_parameters(config.model_path)
+    action_mapper = CameraHierarchicalMapping(n_camera_bins=11)
+    action_space = DictType(**action_mapper.get_action_space_update())
+
+    policy = MinecraftAgentPolicy(
+        action_space=action_space,
+        policy_kwargs=policy_kwargs,
+        pi_head_kwargs=pi_head_kwargs,
+    ).to(device)
+
+    path = weights_path or config.weights_path
+    policy.load_state_dict(th.load(path, map_location=device), strict=False)
+    print(f"[build_policy] Loaded weights from {path}")
+    return policy, action_mapper
+
+
+def build_frozen_policy(config: PPOConfig, device: th.device):
+    """Return a frozen pretrained policy for KL regularization, or None."""
+    if not os.path.exists(config.pretrained_weights_path):
+        print(f"[build_frozen_policy] WARNING: {config.pretrained_weights_path} not found "
+              f"— falling back to entropy bonus.")
+        return None
+    policy, _ = build_policy(config, device,
+                              weights_path=config.pretrained_weights_path)
+    policy.eval()
+    for p in policy.parameters():
+        p.requires_grad_(False)
+    print(f"[build_frozen_policy] Frozen policy loaded (KL coef={config.kl_pretrained_coef})")
+    return policy
+
+
+def suppress_movement_in_policy(policy, bias_value: float = -10.0) -> None:
+    """
+    Set large negative biases for all button combinations that contain movement actions
+    (forward/back/left/right/sprint/sneak), so the policy starts with near-zero
+    probability of moving. Useful for craft tasks where movement is disabled.
+
+    The buttons pi_head is a CategoricalActionHead over BUTTONS_COMBINATIONS.
+    Movement groups are at fixed positions in the combination tuple:
+      index 1 = fore_back, index 2 = left_right, index 3 = sprint_sneak
+
+    A gradient hook is registered to keep these biases frozen at bias_value
+    throughout training — without it the kl_pretrained loss would pull them
+    back toward the pretrained (movement-enabled) values.
+    """
+    combos = CameraHierarchicalMapping.BUTTONS_COMBINATIONS
+    movement_positions = {1, 2, 3}  # fore_back, left_right, sprint_sneak in combo tuple
+    movement_indices = [
+        i for i, combo in enumerate(combos)
+        if isinstance(combo, tuple) and any(combo[p] != "none" for p in movement_positions)
+    ]
+    bias = policy.pi_head["buttons"].linear_layer.bias
+    with th.no_grad():
+        bias[movement_indices] = bias_value
+
+    # Freeze: zero gradients for movement indices after every backward pass.
+    # Without this, the kl_pretrained loss pulls these biases back toward the
+    # pretrained values, gradually re-enabling movement.
+    idx_t = th.tensor(movement_indices, dtype=th.long)
+    def _freeze_movement_grads(grad):
+        g = grad.clone()
+        g[idx_t] = 0.0
+        return g
+    bias.register_hook(_freeze_movement_grads)
+
+    print(f"[suppress_movement] bias={bias_value}, frozen {len(movement_indices)}/{len(combos)} movement combos")
+
+
+def make_action_transformer() -> ActionTransformer:
+    return ActionTransformer(**ACTION_TRANSFORMER_KWARGS)
+
+
+def make_env(config: PPOConfig):
+    """
+    Build the training environment for the configured mode.
+
+    "sequential"  SequentialRewardEnv — TASKS curriculum from config.py
+    "single"      SurvivalRewardEnv   — flat reward for config.single_task_items
+    """
+    from config import TASKS
+
+    base = SurvivalEnv(start_inventory=config.start_inventory, **ENV_KWARGS).make()
+
+    if config.mode == "sequential":
+        start_task_idx = 0
+        if config.start_task:
+            names = [t.name for t in TASKS]
+            if config.start_task not in names:
+                raise ValueError(f"start_task '{config.start_task}' not found in TASKS. "
+                                 f"Available: {names}")
+            start_task_idx = names.index(config.start_task)
+
+        env = SequentialRewardEnv(base, start_task_idx=start_task_idx, repeat=config.train_on_repeat)
+        env.seed(config.world_seed)
+        print(f"[make_env] mode=sequential  start_task={TASKS[start_task_idx].display_name}"
+              f"  seed={config.world_seed}  repeat={config.train_on_repeat}")
+        if config.start_inventory:
+            print(f"[make_env] start_inventory={list(config.start_inventory)}")
+    else:
+        env = SurvivalRewardEnv(base, item_ids=list(config.single_task_items))
+        print(f"[make_env] mode=single  items={list(config.single_task_items)}")
+
+    return env
+</file>
+
+<file path="video_logger.py">
+import os
+
+import cv2
+import numpy as np
+import torch as th
+from torch.utils.tensorboard import SummaryWriter
+
+
+class VideoLogger:
+    """
+    Records training rollout frames as MP4 files and logs them (+ scalar metrics)
+    to TensorBoard. Frames are collected during the normal training rollout —
+    no separate evaluation episode, no environment reset.
+
+    Usage:
+        video_logger = VideoLogger(log_dir="/workspace/logs", fps=20, record_every=10)
+        # inside training loop, before rollout:
+        video_logger.start_rollout(update_num)
+        # inside rollout step:
+        video_logger.add_frame(obs["pov"])
+        # after PPO update:
+        video_logger.log_metrics(update_num, metrics_dict)
+        video_logger.maybe_save_video(update_num)
+    """
+
+    def __init__(self, log_dir: str, fps: int = 20, record_every: int = 10):
+        self.fps = fps
+        self.record_every = record_every
+        self.video_dir = os.path.join(log_dir, "videos")
+        os.makedirs(self.video_dir, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=os.path.join(log_dir, "tb"))
+        self._frame_buffer: list = []
+        self._recording = False
+
+    def start_rollout(self, update_num: int):
+        """Call before each rollout. Starts buffering frames if this update will be recorded."""
+        self._recording = ((update_num + 1) % self.record_every == 0)
+        self._frame_buffer.clear()
+
+    def add_frame(self, frame: np.ndarray):
+        """Add a raw obs['pov'] frame during rollout (only buffered when recording)."""
+        if self._recording:
+            self._frame_buffer.append(frame.copy())
+
+    def log_metrics(self, update_num: int, metrics: dict):
+        """Write scalar metrics to TensorBoard."""
+        for key, value in metrics.items():
+            self.writer.add_scalar(f"train/{key}", value, global_step=update_num)
+        self.writer.flush()
+
+    def maybe_save_video(self, update_num: int):
+        """Save buffered rollout frames as MP4 + TensorBoard video if applicable."""
+        if not self._recording or not self._frame_buffer:
+            return
+        self._save_mp4(self._frame_buffer, update_num)
+        self._log_tb_video(self._frame_buffer, update_num)
+        self._frame_buffer.clear()
+        self._recording = False
+
+    # ── private helpers ────────────────────────────────────────────────────
+
+    def _save_mp4(self, frames: list, update_num: int):
+        """Save frames as an MP4 file using OpenCV."""
+        H, W, _ = frames[0].shape
+        path = os.path.join(self.video_dir, f"update_{update_num:05d}.mp4")
+
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(path, fourcc, self.fps, (W, H))
+        for frame in frames:
+            writer.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+        writer.release()
+        print(f"[VideoLogger] Saved {path}  ({len(frames)} frames)")
+
+    def _log_tb_video(self, frames: list, update_num: int):
+        """
+        Log video to TensorBoard.
+        SummaryWriter.add_video expects shape (N, T, C, H, W) float32 in [0, 1].
+        """
+        vid = np.stack(frames, axis=0).astype(np.float32) / 255.0  # (T, H, W, C)
+        vid = th.from_numpy(vid).permute(0, 3, 1, 2).unsqueeze(0)  # (1, T, C, H, W)
+        self.writer.add_video("train/rollout", vid, global_step=update_num, fps=self.fps)
+        self.writer.flush()
+
+    def close(self):
+        self.writer.close()
+</file>
+
+<file path="vpt_actor.py">
+import sys
+sys.path.insert(0, '/workspace/vpt')
+
+import numpy as np
+import torch as th
+import cv2
+
+from lib.tree_util import tree_map
+
+AGENT_RESOLUTION = (128, 128)
+
+
+def _resize_image(img, target_resolution):
+    return cv2.resize(img, target_resolution, interpolation=cv2.INTER_LINEAR)
+
+
+class VPTActor:
+    """Wraps MinecraftAgentPolicy for no-gradient rollout inference."""
+
+    def __init__(self, policy, action_mapper, action_transformer, device):
+        self.policy = policy
+        self.action_mapper = action_mapper
+        self.action_transformer = action_transformer
+        self.device = device
+
+    def get_initial_hidden_state(self, batch_size=1):
+        return self.policy.initial_state(batch_size)
+
+    def step(self, obs, hidden_state, done=False):
+        """
+        One inference step.
+
+        Args:
+            obs:          MineRL obs dict with 'pov' key, shape (H, W, 3) uint8
+            hidden_state: recurrent state from previous step (or initial)
+            done:         whether the previous step ended an episode
+
+        Returns:
+            env_action:   MineRL-compatible action dict for env.step()
+            agent_action: dict{"buttons": Tensor, "camera": Tensor} for buffer
+            log_prob:     float
+            value:        float
+            new_hidden:   detached recurrent state for next step
+        """
+        # MineRL obs["pov"] ist (H, W, C) bei 640x360 → resize auf 128x128 für Policy
+        resized = _resize_image(obs["pov"], AGENT_RESOLUTION)
+
+        agent_input = {"img": th.from_numpy(resized[None]).to(self.device)}
+        first = th.from_numpy(np.array((done,))).to(self.device)
+
+        agent_action, new_hidden, result = self.policy.act(
+            agent_input, first, hidden_state, stochastic=True
+        )
+
+        new_hidden = tree_map(lambda x: x.detach(), new_hidden)
+
+        # Interne VPT-Action → MineRL-kompatibles Dict
+        action_np = {
+            "buttons": agent_action["buttons"].cpu().numpy(),
+            "camera":  agent_action["camera"].cpu().numpy(),
+        }
+        env_action = self.action_transformer.policy2env(
+            self.action_mapper.to_factored(action_np)
+        )
+
+        return (
+            env_action,
+            agent_action,
+            result["log_prob"].item(),
+            result["vpred"].item(),
+            new_hidden,
+            resized,        # (128, 128, 3) für den Buffer
+        )
+</file>
+
+</files>

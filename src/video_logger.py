@@ -43,9 +43,15 @@ class VideoLogger:
             self._frame_buffer.append(frame.copy())
 
     def log_metrics(self, update_num: int, metrics: dict):
-        """Write scalar metrics to TensorBoard."""
+        """Write scalar metrics to TensorBoard, keyed by update number."""
         for key, value in metrics.items():
             self.writer.add_scalar(f"train/{key}", value, global_step=update_num)
+        self.writer.flush()
+
+    def log_episode(self, episode_num: int, metrics: dict):
+        """Write per-episode scalar metrics to TensorBoard, keyed by episode number."""
+        for key, value in metrics.items():
+            self.writer.add_scalar(f"episode/{key}", value, global_step=episode_num)
         self.writer.flush()
 
     def maybe_save_video(self, update_num: int):

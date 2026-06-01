@@ -39,7 +39,7 @@ from live_stream import LiveStreamer
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train VPT agent with PPO")
-    p.add_argument("--mode",              default=None,  choices=["sequential", "single"],
+    p.add_argument("--mode",              default=None,  choices=["sequential", "single", "navigation"],
                    help="Training mode (default: sequential)")
     p.add_argument("--single_task_items", default=None,  nargs="+",
                    help="Items to reward in single mode, e.g. --single_task_items log planks")
@@ -54,6 +54,14 @@ def parse_args():
     p.add_argument("--log_dir",           default=None)
     p.add_argument("--stream_port",       default=None,  type=int)
     p.add_argument("--stream_enabled",    default=None,  type=lambda x: x.lower() != "false")
+    p.add_argument("--nav_target_radius", default=None,  type=float,
+                   help="Navigation: max target distance from spawn (default: 300)")
+    p.add_argument("--nav_success_radius",default=None,  type=float,
+                   help="Navigation: success threshold in blocks (default: 5)")
+    p.add_argument("--nav_reward_scale",  default=None,  type=float,
+                   help="Navigation: multiplier on distance-delta reward (default: 1.0)")
+    p.add_argument("--nav_success_bonus", default=None,  type=float,
+                   help="Navigation: sparse bonus on reaching target (default: 10.0)")
     return p.parse_args()
 
 
@@ -68,15 +76,19 @@ def config_from_args(args) -> PPOConfig:
     if args.learning_rate       is not None: overrides["learning_rate"]     = args.learning_rate
     if args.task_weights_dir    is not None: overrides["task_weights_dir"]  = args.task_weights_dir
     if args.log_dir             is not None: overrides["log_dir"]           = args.log_dir
-    if args.stream_port         is not None: overrides["stream_port"]       = args.stream_port
-    if args.stream_enabled      is not None: overrides["stream_enabled"]    = args.stream_enabled
+    if args.stream_port         is not None: overrides["stream_port"]        = args.stream_port
+    if args.stream_enabled      is not None: overrides["stream_enabled"]     = args.stream_enabled
+    if args.nav_target_radius   is not None: overrides["nav_target_radius"]  = args.nav_target_radius
+    if args.nav_success_radius  is not None: overrides["nav_success_radius"] = args.nav_success_radius
+    if args.nav_reward_scale    is not None: overrides["nav_reward_scale"]   = args.nav_reward_scale
+    if args.nav_success_bonus   is not None: overrides["nav_success_bonus"]  = args.nav_success_bonus
     return PPOConfig(**overrides)
 
 
 # ── Training loop ─────────────────────────────────────────────────────────────
 
 def _collect_fixed(config, env, actor, buffer, video_logger, streamer,
-                   obs, hidden, done, total_steps):
+                   obs, hidden, done, total_steps, nav_episode_count):
     rollout_reward = 0.0
     completed_task_idx = None
     inventory_snapshot = {}
@@ -101,13 +113,21 @@ def _collect_fixed(config, env, actor, buffer, video_logger, streamer,
         obs = next_obs
 
         if done:
+            if config.mode == "navigation" and "nav_episode_return" in info:
+                video_logger.log_episode(nav_episode_count, {
+                    "return":  info["nav_episode_return"],
+                    "length":  info["nav_episode_length"],
+                    "success": float(info.get("nav_success", False)),
+                    "final_dist": info.get("nav_dist", 0.0),
+                })
+                nav_episode_count += 1
             obs, hidden, done = _handle_done(env, actor, info, total_steps)
 
-    return obs, hidden, done, total_steps, rollout_reward, info, completed_task_idx, inventory_snapshot
+    return obs, hidden, done, total_steps, rollout_reward, info, completed_task_idx, inventory_snapshot, nav_episode_count
 
 
 def _collect_reward_triggered(config, env, actor, buffer, video_logger, streamer,
-                               obs, hidden, done, total_steps):
+                               obs, hidden, done, total_steps, nav_episode_count):
     rollout_reward = 0.0
     completed_task_idx = None
     inventory_snapshot = {}
@@ -132,12 +152,20 @@ def _collect_reward_triggered(config, env, actor, buffer, video_logger, streamer
         obs = next_obs
 
         if done:
+            if config.mode == "navigation" and "nav_episode_return" in info:
+                video_logger.log_episode(nav_episode_count, {
+                    "return":  info["nav_episode_return"],
+                    "length":  info["nav_episode_length"],
+                    "success": float(info.get("nav_success", False)),
+                    "final_dist": info.get("nav_dist", 0.0),
+                })
+                nav_episode_count += 1
             obs, hidden, done = _handle_done(env, actor, info, total_steps)
 
         if rollout_reward > 0.0:
             break
 
-    return obs, hidden, done, total_steps, rollout_reward, info, completed_task_idx, inventory_snapshot
+    return obs, hidden, done, total_steps, rollout_reward, info, completed_task_idx, inventory_snapshot, nav_episode_count
 
 
 def _handle_done(env, actor, info, total_steps):
@@ -145,6 +173,11 @@ def _handle_done(env, actor, info, total_steps):
         print(f"  [Step {total_steps:7d}] All tasks complete!")
     if info.get("player_died"):
         print(f"  [Step {total_steps:7d}] Agent died — resetting.")
+    if info.get("nav_success"):
+        dist = info.get("nav_dist", 0.0)
+        target = info.get("nav_target", (0, 0))
+        print(f"  [Step {total_steps:7d}] Navigation success! "
+              f"target=({target[0]:.1f}, {target[1]:.1f})  final_dist={dist:.1f}m")
     return env.reset(), actor.get_initial_hidden_state(), False
 
 
@@ -167,9 +200,12 @@ def _save_task_checkpoint(completed_task_idx, policy, out_dir: str, step: int):
     print(f"  [Step {step:7d}] Checkpoint saved → {path}")
 
 
-def _save_current_weights(task_idx, policy, out_dir: str):
-    task = TASKS[task_idx]
-    path = os.path.join(out_dir, f"task_{task_idx:02d}_{task.name}_latest.weights")
+def _save_current_weights(task_idx, policy, out_dir: str, single_label: str = ""):
+    if single_label:
+        path = os.path.join(out_dir, f"single_{single_label}_latest.weights")
+    else:
+        task = TASKS[task_idx]
+        path = os.path.join(out_dir, f"task_{task_idx:02d}_{task.name}_latest.weights")
     th.save(policy.state_dict(), path)
 
 
@@ -252,6 +288,7 @@ def train(config: PPOConfig) -> None:
     episode_steps = 0   # steps within the current episode (only used when episodes > 0)
     update_num = 0
     total_reward = 0.0
+    nav_episode_count = 0
     prev_task_idx = getattr(env, "task_idx", 0)
 
     if config.episodes > 0:
@@ -273,15 +310,15 @@ def train(config: PPOConfig) -> None:
         info = {}
 
         if config.update_mode == "fixed":
-            obs, hidden, done, total_steps, rollout_reward, info, completed_task_idx, inventory_snapshot = _collect_fixed(
+            obs, hidden, done, total_steps, rollout_reward, info, completed_task_idx, inventory_snapshot, nav_episode_count = _collect_fixed(
                 config, env, actor, buffer, video_logger, streamer,
-                obs, hidden, done, total_steps,
+                obs, hidden, done, total_steps, nav_episode_count,
             )
             episode_steps += config.n_steps
         else:
-            obs, hidden, done, total_steps, rollout_reward, info, completed_task_idx, inventory_snapshot = _collect_reward_triggered(
+            obs, hidden, done, total_steps, rollout_reward, info, completed_task_idx, inventory_snapshot, nav_episode_count = _collect_reward_triggered(
                 config, env, actor, buffer, video_logger, streamer,
-                obs, hidden, done, total_steps,
+                obs, hidden, done, total_steps, nav_episode_count,
             )
 
         total_reward += rollout_reward
@@ -310,7 +347,13 @@ def train(config: PPOConfig) -> None:
         metrics = updater.update(buffer)
         updater.decay_kl_coef()
         update_num += 1
-        _save_current_weights(info.get("task_idx", prev_task_idx), policy, config.task_weights_dir)
+        if config.mode == "single":
+            single_label = "_".join(config.single_task_items)
+            _save_current_weights(0, policy, config.task_weights_dir, single_label)
+        elif config.mode == "navigation":
+            _save_current_weights(0, policy, config.task_weights_dir, "navigation")
+        else:
+            _save_current_weights(info.get("task_idx", prev_task_idx), policy, config.task_weights_dir)
 
         ep_label = f"ep={episode_count + 1}/{config.episodes}  " if config.episodes > 0 else ""
         task_label = (
@@ -318,8 +361,14 @@ def train(config: PPOConfig) -> None:
             if config.mode == "sequential" and "task_idx" in info
             else ""
         )
+        nav_label = (
+            f"dist={info.get('nav_dist', 0.0):.1f}  success={info.get('nav_success', False)}  "
+            if config.mode == "navigation"
+            else ""
+        )
         print(
             f"[Update {update_num:4d} | Steps {total_steps:8d} | {ep_label}{task_label}] "
+            f"{nav_label}"
             f"policy_loss={metrics['policy_loss']:.4f}  "
             f"value_loss={metrics['value_loss']:.4f}  "
             f"approx_kl={metrics['approx_kl']:.4f}  "
@@ -328,12 +377,16 @@ def train(config: PPOConfig) -> None:
             f"rollout_r={rollout_reward:.2f}  total_r={total_reward:.1f}"
         )
 
-        video_logger.log_metrics(update_num, {
+        log_metrics = {
             **metrics,
             "rollout_reward": rollout_reward,
             "total_reward": total_reward,
             "task_idx": info.get("task_idx", 0),
-        })
+        }
+        if config.mode == "navigation":
+            log_metrics["nav_dist"] = info.get("nav_dist", 0.0)
+            log_metrics["nav_success"] = float(info.get("nav_success", False))
+        video_logger.log_metrics(update_num, log_metrics)
         video_logger.maybe_save_video(update_num)
 
         if done and info.get("all_tasks_complete"):

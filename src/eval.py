@@ -76,7 +76,8 @@ def main():
     # needed for inventory restoration on death.
     spec = SurvivalEnv(**ENV_KWARGS)
     base = spec.make()
-    env  = SurvivalRewardEnv(base, keep_inventory=keep_inventory, survival_spec=spec)
+    env  = SurvivalRewardEnv(base, keep_inventory=keep_inventory, survival_spec=spec,
+                             item_ids=list(config.single_task_items))
 
     policy, action_mapper = build_policy(config, device, weights_path=weights)
     actor = VPTActor(policy, action_mapper, make_action_transformer(), device)
@@ -96,6 +97,13 @@ def main():
     csv_file.flush()
     log_cursor = 0  # index into env.item_log up to which we've already written
 
+    # ── Reward log ────────────────────────────────────────────────────────────
+    reward_csv_path = os.path.join(out_dir, "reward_log.csv")
+    reward_csv_file = open(reward_csv_path, "w", newline="")
+    reward_csv_writer = csv.DictWriter(reward_csv_file, fieldnames=["step", "reward", "total_reward"])
+    reward_csv_writer.writeheader()
+    reward_csv_file.flush()
+
     policy.eval()
     obs = env.reset()
     hidden = actor.get_initial_hidden_state()
@@ -106,7 +114,8 @@ def main():
 
     print(f"[eval] Running {args.steps} steps  weights={weights}"
           f"  keep_inventory={keep_inventory}  video={not args.no_video}")
-    print(f"[eval] Item log → {csv_path}")
+    print(f"[eval] Item log    → {csv_path}")
+    print(f"[eval] Reward log  → {reward_csv_path}")
 
     for step in range(args.steps):
         env_action, _, _, _, hidden, frame = actor.step(obs, hidden, done)
@@ -116,6 +125,10 @@ def main():
             video.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
 
         total_reward += reward
+
+        if reward != 0.0:
+            reward_csv_writer.writerow({"step": step + 1, "reward": reward, "total_reward": total_reward})
+            reward_csv_file.flush()
 
         # Write any new item log entries that appeared this step
         new_entries = env.item_log[log_cursor:]
@@ -138,6 +151,7 @@ def main():
     print(f"\n[eval] Total reward: {total_reward:.2f}  deaths: {death_count}")
 
     csv_file.close()
+    reward_csv_file.close()
     env.close()
 
     if video is not None:

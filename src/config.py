@@ -69,6 +69,8 @@ MASTER_REWARD_TABLE: List[RewardItem] = [
     # ── Diamond tier (uncapped) ─────────────────────────────────────────
     RewardItem("diamond",         "Diamond",          max_qty=float("inf"), reward_per_item=8/3),
     RewardItem("diamond_pickaxe", "Diamond Pickaxe",  max_qty=float("inf"), reward_per_item=8.0),
+    # ── Basic blocks ────────────────────────────────────────────────────
+    RewardItem("dirt",            "Dirt",             max_qty=float("inf"), reward_per_item=1.0),
 ]
 
 _REWARD_INDEX: dict = {item.item_id: item for item in MASTER_REWARD_TABLE}
@@ -176,9 +178,10 @@ class PPOConfig:
     # ── Training mode ──────────────────────────────────────────────────
     # "sequential"  train on TASKS curriculum (sequential_env)
     # "single"      train on a flat reward for single_task_items only
-    mode: str = "sequential"
+    # "navigation"  distance-delta reward to a random XZ target
+    mode: str = "navigation"
     # item_ids to reward in "single" mode (must exist in MASTER_REWARD_TABLE)
-    single_task_items: tuple = ("log",)
+    single_task_items: tuple = ("dirt",)
     # If True, stay on the current task after completion instead of advancing
     train_on_repeat: bool = True
 
@@ -192,7 +195,7 @@ class PPOConfig:
     # ── PPO hyperparameters ────────────────────────────────────────────
     n_epochs: int = 1
     batch_size: int = 64
-    gamma: float = 0.999
+    gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
     ent_coef: float = 0.01
@@ -201,7 +204,7 @@ class PPOConfig:
     target_kl: float = 0.02
 
     # ── KL regularization vs frozen pretrained policy ──────────────────
-    kl_pretrained_coef: float = 0.2
+    kl_pretrained_coef: float = 0.1
     kl_pretrained_coef_decay: float = 0.9995
 
     # ── Optimizer ──────────────────────────────────────────────────────
@@ -224,12 +227,20 @@ class PPOConfig:
     #                  Use actual MC item IDs (e.g. "oak_log", not the aggregated "log").
     #                  Example: (("oak_log", 8), ("stick", 4))
     start_task: str = "craft_wood_items"
-    start_inventory: tuple = (("spruce_log", 8),)
+    start_inventory: tuple = ()
 
     # ── Training length ────────────────────────────────────────────────
-    episodes: int = 20
-    total_timesteps: int = 1000
+    episodes: int = 50
+    total_timesteps: int = 2000
     world_seed: int = 42
+
+    # ── Navigation ─────────────────────────────────────────────────────
+    # Only used when mode="navigation".
+    # Target sampled uniformly in a disk of nav_target_radius blocks around spawn (XZ only).
+    nav_target_radius: float = 200.0   # max distance of random target from spawn
+    nav_success_radius: float = 5.0    # distance threshold for episode success
+    nav_reward_scale: float = 1.0      # multiplier on distance-delta reward
+    nav_success_bonus: float = 100.0    # one-time bonus on reaching target
 
     # ── Live stream ────────────────────────────────────────────────────
     stream_enabled: bool = True
