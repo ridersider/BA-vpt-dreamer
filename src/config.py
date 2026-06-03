@@ -230,14 +230,14 @@ class PPOConfig:
     start_inventory: tuple = ()
 
     # ── Training length ────────────────────────────────────────────────
-    episodes: int = 50
+    episodes: int = 10
     total_timesteps: int = 2000
     world_seed: int = 42
 
     # ── Navigation ─────────────────────────────────────────────────────
     # Only used when mode="navigation".
     # Target sampled uniformly in a disk of nav_target_radius blocks around spawn (XZ only).
-    nav_target_radius: float = 200.0   # max distance of random target from spawn
+    nav_target_radius: float = 100.0   # max distance of random target from spawn
     nav_success_radius: float = 5.0    # distance threshold for episode success
     nav_reward_scale: float = 1.0      # multiplier on distance-delta reward
     nav_success_bonus: float = 100.0    # one-time bonus on reaching target

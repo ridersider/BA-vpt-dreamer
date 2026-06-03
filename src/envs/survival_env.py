@@ -13,6 +13,7 @@ class SurvivalEnv(HumanSurvival):
 
     def __init__(self, start_inventory: Tuple[Tuple[str, int], ...] = (), **kwargs):
         self._start_inventory = start_inventory
+        self._drawing_decorator_xml: Optional[str] = None
         if "name" not in kwargs:
             kwargs["name"] = "MineRLSurvival-v0"
         super().__init__(**kwargs)
@@ -23,6 +24,15 @@ class SurvivalEnv(HumanSurvival):
             handlers.SpawningInitialCondition(allow_spawning=True),
             handlers.DefaultWorldGenerator(force_reset=True, generator_options='{"seed": "42"}'),
         ]
+
+    def create_server_decorators(self) -> List[Handler]:
+        if self._drawing_decorator_xml:
+            return [handlers.DrawingDecorator(self._drawing_decorator_xml)]
+        return []
+
+    def set_drawing_decorator(self, xml: Optional[str]) -> None:
+        """Set the DrawingDecorator XML used in the next episode's mission XML."""
+        self._drawing_decorator_xml = xml
 
     def create_agent_start(self) -> List[Handler]:
         base = super().create_agent_start()

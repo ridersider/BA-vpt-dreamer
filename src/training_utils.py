@@ -131,7 +131,8 @@ def make_env(config: PPOConfig):
     from config import TASKS
 
     if config.mode == "navigation":
-        base = SurvivalEnv(**ENV_KWARGS).make()
+        nav_spec = SurvivalEnv(**ENV_KWARGS)
+        base = nav_spec.make()
         env = NavigationRewardEnv(
             base,
             target_radius=config.nav_target_radius,
@@ -139,11 +140,13 @@ def make_env(config: PPOConfig):
             reward_scale=config.nav_reward_scale,
             success_bonus=config.nav_success_bonus,
             log_dir=config.log_dir,
+            survival_spec=nav_spec,
         )
         print(f"[make_env] mode=navigation  target_radius={config.nav_target_radius}  "
               f"success_radius={config.nav_success_radius}  "
               f"reward_scale={config.nav_reward_scale}  "
-              f"success_bonus={config.nav_success_bonus}")
+              f"success_bonus={config.nav_success_bonus}  "
+              f"target_tower=red_wool_y1-255")
         return env
 
     base = SurvivalEnv(start_inventory=config.start_inventory, **ENV_KWARGS).make()
