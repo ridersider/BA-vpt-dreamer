@@ -251,4 +251,3 @@ All rewarded items and their caps (based on VPT paper, Table 7):
 | Iron Pickaxe | 1 | 4.0 |
 | Diamond | uncapped | ~2.667 |
 | Diamond Pickaxe | uncapped | 8.0 |
-| Dirt | uncapped | 1.0 |
